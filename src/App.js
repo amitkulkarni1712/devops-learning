@@ -1696,12 +1696,12 @@ LATEST=$(aws rds describe-db-snapshots \\
   --db-instance-identifier streamcore-prod-postgres \\
   --query 'reverse(sort_by(DBSnapshots,&SnapshotCreateTime))[0].DBSnapshotIdentifier' \\
   --output text)
-echo "Latest snapshot: \\${LATEST}"
+echo "Latest snapshot: \${LATEST}"
 
 # Test restore to temp instance
 aws rds restore-db-instance-from-db-snapshot \\
   --db-instance-identifier streamcore-dr-test \\
-  --db-snapshot-identifier \\${LATEST} \\
+  --db-snapshot-identifier \${LATEST} \\
   --db-instance-class db.t3.micro
 
 aws rds wait db-instance-available \\
