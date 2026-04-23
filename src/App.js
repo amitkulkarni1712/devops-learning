@@ -738,7 +738,7 @@ user_stats_view = FeatureView(
 
 # ── Apply + materialize ───────────────────────────────
 feast apply                                        # register definitions
-feast materialize-incremental \$(date -u +%Y-%m-%dT%H:%M:%S)  # push to online store
+feast materialize-incremental $(date -u +%Y-%m-%dT%H:%M:%S)  # push to online store
 
 # ── Fetch features at inference time (Python) ─────────
 from feast import FeatureStore
@@ -1123,7 +1123,7 @@ Format your proposed action as JSON:
 
     # Parse proposed action from response
     import re, json
-    match = re.search(r'\{.*\}', response.content, re.DOTALL)
+    match = re.search(r'{.*}', response.content, re.DOTALL)
     action = json.loads(match.group()) if match else {}
 
     return {"messages": [response], "pending_action": action}
@@ -2595,7 +2595,7 @@ const TOTAL_RES=WEEKS.reduce((s,w)=>s+w.resources.length,0);
 const ALL_PROJECTS=WEEKS.flatMap(w=>w.projects.map((p,i)=>({weekNum:w.week,projIdx:i,name:p.name,hard:p.hard,phase:w.phase,phaseColor:w.phaseColor})));
 
 // ─── STORAGE ──────────────────────────────────────────────────────────────────
-async function loadT(){try{const r=localStorage.getItem("ai_plan_v2");return r?JSON.parse(r.value):null;}catch{return null;}}
+async function loadT(){try{const r=await window.storage.get("ai_plan_v2");return r?JSON.parse(r.value):null;}catch{return null;}}
 async function saveT(d){try{await window.storage.set("ai_plan_v2",JSON.stringify(d));}catch{}}
 function freshT(){
   const ws={},pr={};
