@@ -1173,12 +1173,12 @@ EOF
 # Build and push all services to ECR
 AWS_ID=$(aws sts get-caller-identity --query Account --output text)
 ECR="$AWS_ID.dkr.ecr.us-east-1.amazonaws.com"
-aws ecr get-login-password | docker login --username AWS --password-stdin \\${ECR}
+aws ecr get-login-password | docker login --username AWS --password-stdin \${ECR}
 
 for svc in user-service content-service stream-service payment-service; do
-  aws ecr create-repository --repository-name "streamcore/\\${svc}"
-  docker build -t \\${ECR}/streamcore/\\${svc}:latest services/\\${svc}/
-  docker push \\${ECR}/streamcore/\\${svc}:latest
+  aws ecr create-repository --repository-name "streamcore/\${svc}"
+  docker build -t \${ECR}/streamcore/\${svc}:latest services/\${svc}/
+  docker push \${ECR}/streamcore/\${svc}:latest
 done`},
      {title:"Kubernetes Deployment with HPA + PDB",type:"code",lang:"yaml",content:`apiVersion: apps/v1
 kind: Deployment
@@ -1696,12 +1696,12 @@ LATEST=$(aws rds describe-db-snapshots \\
   --db-instance-identifier streamcore-prod-postgres \\
   --query 'reverse(sort_by(DBSnapshots,&SnapshotCreateTime))[0].DBSnapshotIdentifier' \\
   --output text)
-echo "Latest snapshot: \\\${LATEST}"
+echo "Latest snapshot: \\${LATEST}"
 
 # Test restore to temp instance
 aws rds restore-db-instance-from-db-snapshot \\
   --db-instance-identifier streamcore-dr-test \\
-  --db-snapshot-identifier \\\${LATEST} \\
+  --db-snapshot-identifier \\${LATEST} \\
   --db-instance-class db.t3.micro
 
 aws rds wait db-instance-available \\
