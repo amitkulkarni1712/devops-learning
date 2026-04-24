@@ -1026,6 +1026,240 @@ kubectl port-forward svc/backstage 7007:7007 -n platform
 
 
 
+
+const PCOL = {P1:"#00FFB2",P2:"#FF6B35",P3:"#A855F7",P4:"#FACC15"};
+const UCOL = {NOW:"#00FFB2",SOON:"#FF6B35","NEXT YEAR":"#A855F7"};
+const AI_TOTAL_HOURS = AI_WEEKS.reduce((s,w)=>s+w.hours,0);
+
+function freshAITracker(){
+  const ws={},pr={};
+  AI_WEEKS.forEach(w=>{ws[w.week]="not_started";w.projects.forEach((_,i)=>{pr[`${w.week}-${i}`]=false;});});
+  return{weekStatus:ws,projects:pr,startDate:new Date().toISOString()};
+}
+
+function AIPlan(){
+  const [openWeek,setOpenWeek]=useState(null);
+  const [innerTab,setInnerTab]=useState({});
+  const [mainTab,setMainTab]=useState("roadmap");
+  const [resFilter,setResFilter]=useState("all");
+  const [tracker,setTracker]=useState(null);
+  const [loaded,setLoaded]=useState(false);
+
+  useEffect(()=>{loadData("ai_plan_v3").then(d=>{setTracker(d||freshAITracker());setLoaded(true);});}, []);
+  const save=(n)=>{setTracker(n);saveData("ai_plan_v3",n);};
+  const cycleStatus=(wn)=>{
+    const cur=tracker?.weekStatus[wn]||"not_started";
+    const nxt=cur==="not_started"?"in_progress":cur==="in_progress"?"done":"not_started";
+    save({...tracker,weekStatus:{...tracker.weekStatus,[wn]:nxt}});
+  };
+  const toggleProj=(k)=>save({...tracker,projects:{...tracker.projects,[k]:!tracker.projects?.[k]}});
+  const resetT=()=>save(freshAITracker());
+
+  const doneW=tracker?Object.values(tracker.weekStatus).filter(s=>s==="done").length:0;
+  const inProgW=tracker?Object.values(tracker.weekStatus).filter(s=>s==="in_progress").length:0;
+  const doneP=tracker?Object.values(tracker.projects).filter(Boolean).length:0;
+  const doneH=tracker?AI_WEEKS.filter(w=>tracker.weekStatus[w.week]==="done").reduce((s,w)=>s+w.hours,0):0;
+  const allProjects=AI_WEEKS.flatMap(w=>w.projects.map((p,i)=>({weekNum:w.week,projIdx:i,name:p.name,hard:p.hard,phase:w.phase,phaseColor:w.phaseColor})));
+  const pct=Math.round((doneW/AI_WEEKS.length)*100);
+  const getIT=(wn)=>innerTab[wn]||"overview";
+  const setIT=(wn,t)=>setInnerTab(p=>({...p,[wn]:t}));
+
+  if(!loaded) return <div style={{color:"#00FFB2",padding:40,textAlign:"center",fontFamily:"monospace",fontSize:11,letterSpacing:3}}>LOADING...</div>;
+
+  return(
+    <div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:9,marginBottom:22}}>
+        {[["12 WEEKS","3-Month Plan"],[`${AI_TOTAL_HOURS} HRS`,"~31h/week"],["4 PILLARS","Core Domains"],[`${pct}%`,"Completed"]].map(([v,l])=>(
+          <div key={v} style={{background:"#0D1117",border:"1px solid #00FFB230",borderTop:"3px solid #00FFB2",padding:"12px 14px",borderRadius:4}}>
+            <div style={{fontFamily:"'Syne',sans-serif",fontSize:20,fontWeight:800,color:"#00FFB2"}}>{v}</div>
+            <div style={{fontSize:9,color:"#4A5568",letterSpacing:2,textTransform:"uppercase"}}>{l}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(185px,1fr))",gap:9,marginBottom:22}}>
+        {[{id:"P1",label:"AI-Native Platform Eng.",color:"#00FFB2",icon:"◈"},{id:"P2",label:"MLOps & Model Lifecycle",color:"#FF6B35",icon:"⬡"},{id:"P3",label:"AI Agents for Infra",color:"#A855F7",icon:"◉"},{id:"P4",label:"GPU & AI Infra at Scale",color:"#FACC15",icon:"◆"}].map(p=>(
+          <div key={p.id} style={{background:"#0D1117",border:`1px solid ${p.color}25`,borderTop:`3px solid ${p.color}`,padding:"12px 14px",borderRadius:4}}>
+            <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:6}}><span style={{color:p.color,fontSize:14}}>{p.icon}</span><span style={{color:p.color,fontSize:9,letterSpacing:2}}>{p.id}</span></div>
+            <div style={{fontSize:11,fontWeight:500,color:"#E8EAF0"}}>{p.label}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{display:"flex",borderBottom:"1px solid #1A2030",marginBottom:20}}>
+        {[["roadmap","Roadmap"],["tracker","Tracker"]].map(([t,l])=>(
+          <button key={t} className="tb" onClick={()=>setMainTab(t)} style={{color:mainTab===t?"#00FFB2":"#4A5568",padding:"10px 16px",fontSize:10,letterSpacing:3,textTransform:"uppercase",borderBottom:mainTab===t?"2px solid #00FFB2":"2px solid transparent",marginBottom:-1}}>
+            {l}{t==="tracker"&&doneW>0&&<span style={{marginLeft:5,background:"#00FFB220",color:"#00FFB2",fontSize:8,padding:"1px 4px",borderRadius:2}}>{doneW}/{AI_WEEKS.length}</span>}
+          </button>
+        ))}
+      </div>
+
+      {mainTab==="roadmap"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:5}}>
+          {AI_WEEKS.map(w=>{
+            const isOn=openWeek===w.week;
+            const st=tracker?.weekStatus[w.week]||"not_started";
+            const sm=SMETA[st];
+            const wProjs=w.projects.map((_,i)=>({k:`${w.week}-${i}`,done:tracker?.projects[`${w.week}-${i}`]||false}));
+            const pDone=wProjs.filter(p=>p.done).length;
+            const it=getIT(w.week);
+            const res=resFilter==="all"?w.resources:w.resources.filter(r=>r.type===resFilter);
+            return(
+              <div key={w.week}>
+                <div className={`wk${isOn?" on":""}`} onClick={()=>setOpenWeek(isOn?null:w.week)}
+                  style={{background:"#0D1117",borderRadius:isOn?"4px 4px 0 0":4,padding:"14px 18px",borderLeft:`3px solid ${w.phaseColor}`}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:7}}>
+                    <div style={{display:"flex",alignItems:"center",gap:11}}>
+                      <span style={{fontFamily:"'Syne',sans-serif",fontSize:12,fontWeight:800,color:w.phaseColor,minWidth:20}}>W{w.week}</span>
+                      <div>
+                        <div style={{fontSize:12,color:"#E8EAF0"}}>{w.title}</div>
+                        <div style={{fontSize:9,color:"#4A5568",marginTop:1}}>{w.phase} · {w.hours}h · {(w.resources||[]).length} refs</div>
+                      </div>
+                    </div>
+                    <div style={{display:"flex",alignItems:"center",gap:6}}>
+                      <span style={{fontSize:9,color:sm.tc}}>{sm.dot}</span>
+                      <span style={{background:`${PCOL[w.pillar]}12`,color:PCOL[w.pillar],fontSize:8,letterSpacing:2,padding:"2px 7px",borderRadius:2}}>{w.pillar}</span>
+                      {pDone>0&&<span style={{fontSize:9,color:"#00FFB2"}}>{pDone}/{w.projects.length}✓</span>}
+                      <span style={{color:"#4A5568",fontSize:10}}>{isOn?"▲":"▼"}</span>
+                    </div>
+                  </div>
+                </div>
+                {isOn&&(
+                  <div style={{background:"#0A0E14",border:"1px solid #1A2030",borderTop:"none",borderRadius:"0 0 4px 4px"}}>
+                    <div style={{display:"flex",borderBottom:"1px solid #1A2030",padding:"0 16px"}}>
+                      {[["overview","Overview"],["content","📖 Learn"],["resources","References"]].map(([t,l])=>(
+                        <button key={t} className="itb" onClick={e=>{e.stopPropagation();setIT(w.week,t);}}
+                          style={{color:it===t?"#00FFB2":"#4A5568",padding:"9px 13px",fontSize:9,letterSpacing:2,textTransform:"uppercase",borderBottom:it===t?"2px solid #00FFB2":"2px solid transparent",marginBottom:-1,background:"none",border:"none"}}>
+                          {l}
+                        </button>
+                      ))}
+                    </div>
+                    <div style={{padding:"16px"}}>
+                      {it==="overview"&&(
+                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+                          <div>
+                            <div style={{fontSize:9,color:"#00FFB2",letterSpacing:3,marginBottom:8}}>WHAT YOU LEARN</div>
+                            {w.skills.map((s,i)=>(
+                              <div key={i} style={{display:"flex",gap:7,marginBottom:5,fontSize:11,color:"#A0A8B8",lineHeight:1.45}}>
+                                <span style={{color:"#00FFB2",flexShrink:0}}>→</span><span>{s}</span>
+                              </div>
+                            ))}
+                            <div style={{marginTop:12}}>
+                              <div style={{fontSize:9,color:"#4A5568",letterSpacing:3,marginBottom:5}}>TOOLS</div>
+                              <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+                                {w.tools.map(t=><span key={t} style={{background:"#1A2030",color:"#A0A8B8",fontSize:9,padding:"2px 7px",borderRadius:2}}>{t}</span>)}
+                              </div>
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{fontSize:9,color:"#FF6B35",letterSpacing:3,marginBottom:8}}>BUILD THESE PROJECTS</div>
+                            {w.projects.map((p,i)=>{
+                              const pk=`${w.week}-${i}`;
+                              const done=tracker?.projects[pk]||false;
+                              return(
+                                <div key={i} style={{background:"#0D1117",border:"1px solid #1A2030",borderLeft:`3px solid ${p.hard?"#FF6B35":"#A855F7"}`,padding:"10px 12px",marginBottom:7,borderRadius:"0 4px 4px 0"}}>
+                                  <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:4}}>
+                                    <span onClick={e=>{e.stopPropagation();toggleProj(pk);}} className="chk" style={{fontSize:13,color:done?"#00FFB2":"#2A3040"}}>{done?"☑":"☐"}</span>
+                                    <span style={{fontSize:11,color:done?"#4A5568":"#E8EAF0",textDecoration:done?"line-through":"none"}}>{p.name}</span>
+                                    {p.hard&&<span style={{background:"#FF6B3520",color:"#FF6B35",fontSize:7,padding:"1px 5px",borderRadius:2}}>HARD</span>}
+                                  </div>
+                                  <div style={{fontSize:10,color:"#4A5568",lineHeight:1.5}}>{p.desc}</div>
+                                </div>
+                              );
+                            })}
+                            <button className="sc" onClick={e=>{e.stopPropagation();cycleStatus(w.week);}}
+                              style={{background:sm.color,color:sm.tc,fontSize:8,padding:"4px 10px",letterSpacing:2,textTransform:"uppercase",border:`1px solid ${sm.tc}30`,marginTop:8}}>
+                              {sm.dot} {sm.label}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                      {it==="content"&&<ContentRenderer sections={w.content||[]}/>}
+                      {it==="resources"&&(
+                        <div>
+                          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12,flexWrap:"wrap",gap:6}}>
+                            <div style={{fontSize:9,color:"#FACC15",letterSpacing:3}}>◆ REFERENCES ({(w.resources||[]).length})</div>
+                            <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+                              {["all","docs","course","video","book","repo"].map(f=>(
+                                <button key={f} className="fb" onClick={e=>{e.stopPropagation();setResFilter(f===resFilter?"all":f);}}
+                                  style={{background:resFilter===f?"#FACC1518":"#0D1117",color:resFilter===f?"#FACC15":"#4A5568",border:`1px solid ${resFilter===f?"#FACC1540":"#1A2030"}`,fontSize:8,padding:"3px 7px",letterSpacing:1,textTransform:"uppercase"}}>
+                                  {f==="all"?"ALL":RMETA[f]?.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(230px,1fr))",gap:6}}>
+                            {res.map((r,i)=>{
+                              const m=RMETA[r.type];
+                              return(
+                                <a key={i} href={r.url} target="_blank" rel="noopener noreferrer" className="rl"
+                                  style={{background:"#0D1117",border:`1px solid ${m.color}20`,borderLeft:`2px solid ${m.color}`,padding:"9px 12px",borderRadius:"0 4px 4px 0"}}>
+                                  <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:3}}><span style={{color:m.color,fontSize:8}}>{m.icon}</span><span style={{fontSize:8,color:m.color,letterSpacing:2}}>{m.label}</span></div>
+                                  <div style={{fontSize:11,color:"#E8EAF0",marginBottom:2}}>{r.label}</div>
+                                  <div style={{fontSize:9,color:"#4A5568",lineHeight:1.4}}>{r.note}</div>
+                                </a>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {mainTab==="tracker"&&(
+        <div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8,marginBottom:20}}>
+            {[{l:"WEEKS DONE",v:doneW,t:AI_WEEKS.length,c:"#00FFB2"},{l:"IN PROGRESS",v:inProgW,t:AI_WEEKS.length,c:"#FF6B35"},{l:"PROJECTS",v:doneP,t:allProjects.length,c:"#A855F7"},{l:"HOURS BANKED",v:doneH,t:AI_TOTAL_HOURS,c:"#FACC15"}].map(s=>(
+              <div key={s.l} style={{background:"#0D1117",border:`1px solid ${s.c}25`,borderTop:`3px solid ${s.c}`,padding:"12px 14px",borderRadius:4}}>
+                <div style={{fontSize:8,color:"#4A5568",letterSpacing:3,marginBottom:5}}>{s.l}</div>
+                <div style={{fontFamily:"'Syne',sans-serif",fontSize:22,fontWeight:800,color:s.c}}>{s.v}<span style={{fontSize:10,color:"#4A5568",fontFamily:"inherit",fontWeight:400}}> / {s.t}</span></div>
+                <div style={{background:"#1A2030",height:3,borderRadius:2,marginTop:6}}><div className="bar" style={{background:s.c,height:"100%",width:`${Math.round((s.v/s.t)*100)}%`,borderRadius:2}}/></div>
+              </div>
+            ))}
+          </div>
+          <div style={{background:"#0D1117",border:"1px solid #00FFB230",borderRadius:4,padding:"12px 16px",marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:9,color:"#00FFB2",letterSpacing:3}}>COMPLETION</span><span style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800,color:"#00FFB2"}}>{pct}%</span></div>
+            <div style={{background:"#1A2030",height:6,borderRadius:3}}><div className="bar" style={{background:"linear-gradient(90deg,#00FFB2,#A855F7)",height:"100%",width:`${pct}%`,borderRadius:3}}/></div>
+            {tracker?.startDate&&<div style={{fontSize:9,color:"#4A5568",marginTop:6}}>Started: {new Date(tracker.startDate).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</div>}
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:4}}>
+            {AI_WEEKS.map(w=>{
+              const st=tracker?.weekStatus[w.week]||"not_started";
+              const sm=SMETA[st];
+              const wp=w.projects.map((_,i)=>({k:`${w.week}-${i}`,done:tracker?.projects[`${w.week}-${i}`]||false}));
+              const pd=wp.filter(p=>p.done).length;
+              return(
+                <div key={w.week} style={{background:"#0D1117",border:"1px solid #1A2030",borderRadius:4,padding:"10px 14px",borderLeft:`3px solid ${w.phaseColor}`}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10}}>
+                      <span style={{fontFamily:"'Syne',sans-serif",fontSize:11,fontWeight:800,color:w.phaseColor}}>W{w.week}</span>
+                      <div><div style={{fontSize:11,color:"#E8EAF0"}}>{w.title}</div><div style={{fontSize:9,color:"#4A5568"}}>{w.hours}h</div></div>
+                    </div>
+                    <div style={{display:"flex",alignItems:"center",gap:7}}>
+                      {wp.map(p=><span key={p.k} onClick={()=>toggleProj(p.k)} className="chk" style={{fontSize:13,color:p.done?"#00FFB2":"#2A3040"}}>{p.done?"☑":"☐"}</span>)}
+                      <span style={{fontSize:9,color:"#4A5568"}}>{pd}/{w.projects.length}</span>
+                      <button className="sc" onClick={()=>cycleStatus(w.week)} style={{background:sm.color,color:sm.tc,fontSize:8,padding:"3px 8px",letterSpacing:2,textTransform:"uppercase",border:`1px solid ${sm.tc}30`}}>{sm.dot} {sm.label}</button>
+                    </div>
+                  </div>
+                  <div style={{marginTop:6,background:"#1A2030",height:2,borderRadius:1}}><div className="bar" style={{background:w.phaseColor,height:"100%",width:`${w.projects.length?Math.round((pd/w.projects.length)*100):0}%`,borderRadius:1}}/></div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{textAlign:"center",paddingTop:12,marginTop:12,borderTop:"1px solid #1A2030"}}>
+            <button onClick={()=>{if(window.confirm("Reset AI plan progress?"))resetT();}} style={{background:"transparent",color:"#4A5568",border:"1px solid #1A2030",fontSize:9,padding:"7px 14px",letterSpacing:2,cursor:"pointer",borderRadius:3}}>↺ RESET</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CTO PROJECT — STREAMCORE PRODUCTION DEPLOYMENT
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1159,7 +1393,7 @@ const CTO_STEPS = [
       '  cluster_endpoint_public_access = true',
       '  eks_managed_node_groups = {',
       '    platform = {',
-      '      instance_types = ["t3.medium"]',
+      '      instance_types = ["t3.small"]   # smallest viable k8s node',
       '      min_size       = 2',
       '      max_size       = 4',
       '      desired_size   = 2',
@@ -1205,7 +1439,7 @@ const CTO_STEPS = [
       '  # Minimal static node group — Karpenter handles the rest',
       '  eks_managed_node_groups = {',
       '    system = {',
-      '      instance_types = ["t3.medium"]',
+      '      instance_types = ["t3.small"]   # smallest viable k8s node',
       '      min_size       = 2',
       '      max_size       = 2',
       '      desired_size   = 2',
@@ -1646,7 +1880,7 @@ const CTO_STEPS = [
       '  identifier        = "streamcore-mysql"',
       '  engine            = "mysql"',
       '  engine_version    = "8.0"',
-      '  instance_class    = "db.t3.micro"  # FREE TIER',
+      '  instance_class    = "db.t3.micro"  # FREE TIER 750hrs/month for 12 months',
       '  allocated_storage = 20             # FREE TIER max',
       '  storage_type      = "gp2"',
       '  db_name           = "streamcore"',
@@ -1709,7 +1943,7 @@ const CTO_STEPS = [
       'resource "aws_elasticache_cluster" "main" {',
       '  cluster_id           = "streamcore-redis"',
       '  engine               = "redis"',
-      '  node_type            = "cache.t3.micro"  # FREE TIER eligible',
+      '  node_type            = "cache.t3.micro"  # FREE TIER 750hrs/month',
       '  num_cache_nodes      = 1',
       '  parameter_group_name = "default.redis7"',
       '  engine_version       = "7.1"',
