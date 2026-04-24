@@ -1024,1154 +1024,1498 @@ kubectl port-forward svc/backstage 7007:7007 -n platform
    ]},
 ];
 
+
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// PLAN 2 — CTO BLUEPRINT: STREAMCORE (16 WEEKS)
+// CTO PROJECT — STREAMCORE PRODUCTION DEPLOYMENT
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const CTO_ARCH_STACK=[
-  {layer:"FRONTEND",items:["React + Next.js","CloudFront CDN","S3 Static"]},
-  {layer:"API GATEWAY",items:["Kong Gateway","JWT Auth","Rate Limiting","WAF"]},
-  {layer:"MICROSERVICES",items:["User (Node)","Content (Go)","Stream (Python)","Payment (Java)","Notification (Node)","Recommend (ML)"]},
-  {layer:"SERVICE MESH",items:["Istio mTLS","Traffic Shaping","Circuit Breaker","Canary Deploys"]},
-  {layer:"DATA",items:["PostgreSQL (RDS)","MongoDB (DocDB)","Redis (ElastiCache)","Kafka (MSK)","S3 Media"]},
-  {layer:"PLATFORM",items:["AWS EKS","Terraform IaC","ArgoCD GitOps","GitHub Actions","Vault Secrets"]},
-  {layer:"OBSERVABILITY",items:["Prometheus","Grafana","Jaeger Tracing","Loki Logs","PagerDuty"]},
-  {layer:"SECURITY",items:["OPA Gatekeeper","Falco Runtime","Trivy Scan","GuardDuty","SOC2 Audit"]},
+// All code blocks stored as arrays to avoid template literal conflicts with
+// shell variables like DOLLAR{VAR}, DOLLAR((expr)), and heredoc syntax.
+
+const CTO_STEPS = [
+  // ─── PHASE 1: FOUNDATION ─────────────────────────────────────────────────
+  {
+    phase: "FOUNDATION",
+    phaseColor: "#00FFB2",
+    id: "1.1",
+    title: "Bootstrap AWS + Terraform Remote State",
+    why: "Every production environment starts with a remote state backend. Without it, two engineers running terraform apply simultaneously will corrupt your state file and create duplicate or conflicting resources. S3 + DynamoDB gives you atomic locking and versioned state history — your single source of truth for what exists in AWS.",
+    commands: [
+      "# One-time bootstrap — run this before anything else",
+      "aws configure  # set your AWS credentials",
+      "",
+      "# Create S3 bucket for Terraform state",
+      'aws s3 mb s3://streamcore-tfstate-$(aws sts get-caller-identity --query Account --output text) --region us-east-1',
+      'aws s3api put-bucket-versioning --bucket streamcore-tfstate-ACCOUNT_ID \\',
+      '  --versioning-configuration Status=Enabled',
+      'aws s3api put-bucket-encryption --bucket streamcore-tfstate-ACCOUNT_ID \\',
+      '  --server-side-encryption-configuration \'{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}\'',
+      "",
+      "# DynamoDB table for state locking",
+      'aws dynamodb create-table \\',
+      '  --table-name streamcore-tflock \\',
+      '  --attribute-definitions AttributeName=LockID,AttributeType=S \\',
+      '  --key-schema AttributeName=LockID,KeyType=HASH \\',
+      '  --billing-mode PAY_PER_REQUEST \\',
+      '  --region us-east-1',
+      "",
+      "# Verify",
+      "aws s3 ls | grep streamcore",
+      "aws dynamodb describe-table --table-name streamcore-tflock --query 'Table.TableStatus'",
+    ],
+    expect: "S3 bucket created with versioning enabled. DynamoDB table status: ACTIVE.",
+    tools: ["AWS CLI", "S3", "DynamoDB"],
+  },
+  {
+    phase: "FOUNDATION",
+    phaseColor: "#00FFB2",
+    id: "1.2",
+    title: "VPC + Management Cluster (EKS)",
+    why: "Two clusters, one VPC. The management cluster runs ArgoCD, Istio control plane, and monitoring. The workload cluster runs your actual application. This separation means a bad deployment can never take down your deployment tooling. The management cluster runs 2x t3.medium nodes — cheap, since it only runs platform tooling, not user traffic.",
+    commands: [
+      "# Clone the infra repo",
+      "mkdir streamcore && cd streamcore",
+      "git init && mkdir -p infra/{vpc,eks-mgmt,eks-workload,rds,redis,rabbitmq}",
+      "",
+      "# infra/vpc/main.tf",
+      'cat > infra/vpc/main.tf << \'TFEOF\'',
+      'terraform {',
+      '  required_version = ">= 1.6"',
+      '  backend "s3" {',
+      '    bucket         = "streamcore-tfstate-ACCOUNT_ID"',
+      '    key            = "vpc/terraform.tfstate"',
+      '    region         = "us-east-1"',
+      '    dynamodb_table = "streamcore-tflock"',
+      '    encrypt        = true',
+      '  }',
+      '}',
+      '',
+      'module "vpc" {',
+      '  source  = "terraform-aws-modules/vpc/aws"',
+      '  version = "~> 5.0"',
+      '  name = "streamcore-vpc"',
+      '  cidr = "10.0.0.0/16"',
+      '  azs             = ["us-east-1a", "us-east-1b", "us-east-1c"]',
+      '  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]',
+      '  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]',
+      '  enable_nat_gateway   = true',
+      '  single_nat_gateway   = true   # cost saving — 1 NAT for both clusters',
+      '  enable_dns_hostnames = true',
+      '  private_subnet_tags = {',
+      '    "kubernetes.io/role/internal-elb" = 1',
+      '    "karpenter.sh/discovery"          = "streamcore"',
+      '  }',
+      '  public_subnet_tags = {',
+      '    "kubernetes.io/role/elb" = 1',
+      '  }',
+      '}',
+      '',
+      'output "vpc_id"             { value = module.vpc.vpc_id }',
+      'output "private_subnet_ids" { value = module.vpc.private_subnets }',
+      'output "public_subnet_ids"  { value = module.vpc.public_subnets }',
+      'TFEOF',
+      "",
+      "cd infra/vpc && terraform init && terraform apply -auto-approve",
+    ],
+    expect: "VPC created with 3 private + 3 public subnets across 3 AZs. One NAT gateway.",
+    tools: ["Terraform", "AWS VPC"],
+  },
+  {
+    phase: "FOUNDATION",
+    phaseColor: "#00FFB2",
+    id: "1.3",
+    title: "Management EKS Cluster (Platform Tools)",
+    why: "This cluster hosts only ArgoCD, Istio control plane, and Grafana. Running it on 2x t3.medium nodes keeps cost under $60/month for the management plane. IRSA (IAM Roles for Service Accounts) is set here so pods get AWS permissions without any static credentials stored anywhere in the cluster.",
+    commands: [
+      "# infra/eks-mgmt/main.tf",
+      'cat > infra/eks-mgmt/main.tf << \'TFEOF\'',
+      'terraform {',
+      '  backend "s3" {',
+      '    bucket         = "streamcore-tfstate-ACCOUNT_ID"',
+      '    key            = "eks-mgmt/terraform.tfstate"',
+      '    region         = "us-east-1"',
+      '    dynamodb_table = "streamcore-tflock"',
+      '  }',
+      '}',
+      '',
+      'data "terraform_remote_state" "vpc" {',
+      '  backend = "s3"',
+      '  config = {',
+      '    bucket = "streamcore-tfstate-ACCOUNT_ID"',
+      '    key    = "vpc/terraform.tfstate"',
+      '    region = "us-east-1"',
+      '  }',
+      '}',
+      '',
+      'module "eks_mgmt" {',
+      '  source  = "terraform-aws-modules/eks/aws"',
+      '  version = "~> 20.0"',
+      '  cluster_name    = "streamcore-mgmt"',
+      '  cluster_version = "1.29"',
+      '  vpc_id          = data.terraform_remote_state.vpc.outputs.vpc_id',
+      '  subnet_ids      = data.terraform_remote_state.vpc.outputs.private_subnet_ids',
+      '  enable_irsa     = true',
+      '  cluster_endpoint_public_access = true',
+      '  eks_managed_node_groups = {',
+      '    platform = {',
+      '      instance_types = ["t3.medium"]',
+      '      min_size       = 2',
+      '      max_size       = 4',
+      '      desired_size   = 2',
+      '    }',
+      '  }',
+      '  cluster_addons = {',
+      '    coredns    = { most_recent = true }',
+      '    kube-proxy = { most_recent = true }',
+      '    vpc-cni    = { most_recent = true }',
+      '    aws-ebs-csi-driver = { most_recent = true }',
+      '  }',
+      '}',
+      'TFEOF',
+      "",
+      "cd infra/eks-mgmt && terraform init && terraform apply -auto-approve",
+      "",
+      "# Configure kubectl for management cluster",
+      "aws eks update-kubeconfig --name streamcore-mgmt --region us-east-1 --alias mgmt",
+      "kubectl config use-context mgmt",
+      "kubectl get nodes  # should show 2 t3.medium nodes",
+    ],
+    expect: "2 t3.medium nodes in Ready state. kubectl config shows 'mgmt' context.",
+    tools: ["Terraform", "EKS", "kubectl"],
+  },
+  {
+    phase: "FOUNDATION",
+    phaseColor: "#00FFB2",
+    id: "1.4",
+    title: "Workload EKS Cluster (Application Traffic)",
+    why: "The workload cluster runs actual user-facing services. It uses Karpenter instead of managed node groups so nodes provision and terminate based on actual pod demand — no over-provisioning. Spot instances handle burst traffic at 70% discount. On-demand instances handle the baseline minimum. This is the FinOps-first cluster design.",
+    commands: [
+      "# infra/eks-workload/main.tf",
+      'cat > infra/eks-workload/main.tf << \'TFEOF\'',
+      'module "eks_workload" {',
+      '  source  = "terraform-aws-modules/eks/aws"',
+      '  version = "~> 20.0"',
+      '  cluster_name    = "streamcore-workload"',
+      '  cluster_version = "1.29"',
+      '  vpc_id          = data.terraform_remote_state.vpc.outputs.vpc_id',
+      '  subnet_ids      = data.terraform_remote_state.vpc.outputs.private_subnet_ids',
+      '  enable_irsa     = true',
+      '  cluster_endpoint_public_access = true',
+      '  # Minimal static node group — Karpenter handles the rest',
+      '  eks_managed_node_groups = {',
+      '    system = {',
+      '      instance_types = ["t3.medium"]',
+      '      min_size       = 2',
+      '      max_size       = 2',
+      '      desired_size   = 2',
+      '      labels         = { role = "system" }',
+      '    }',
+      '  }',
+      '  # Tags required for Karpenter node discovery',
+      '  tags = {',
+      '    "karpenter.sh/discovery" = "streamcore-workload"',
+      '  }',
+      '}',
+      'TFEOF',
+      "",
+      "cd infra/eks-workload && terraform init && terraform apply -auto-approve",
+      "aws eks update-kubeconfig --name streamcore-workload --region us-east-1 --alias workload",
+      "",
+      "# Verify both contexts",
+      "kubectl config get-contexts",
+      "kubectl --context=mgmt get nodes",
+      "kubectl --context=workload get nodes",
+    ],
+    expect: "Two kubectl contexts: mgmt and workload. Each shows 2 t3.medium nodes Ready.",
+    tools: ["Terraform", "EKS", "Karpenter"],
+  },
+
+  // ─── PHASE 2: GITOPS WITH ARGOCD ─────────────────────────────────────────
+  {
+    phase: "GITOPS",
+    phaseColor: "#A855F7",
+    id: "2.1",
+    title: "Install ArgoCD on Management Cluster",
+    why: "ArgoCD lives on the management cluster and deploys to the workload cluster. This is the GitOps topology: one control plane watching Git, pushing to many clusters. Every change to your application goes through Git — no human ever runs kubectl apply on the workload cluster directly. Your Git history becomes your deployment audit log.",
+    commands: [
+      "kubectl config use-context mgmt",
+      "",
+      "# Install ArgoCD",
+      "kubectl create namespace argocd",
+      "kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml",
+      "kubectl wait --for=condition=available deployment/argocd-server -n argocd --timeout=300s",
+      "",
+      "# Expose ArgoCD UI via LoadBalancer",
+      'kubectl patch svc argocd-server -n argocd -p \'{"spec": {"type": "LoadBalancer"}}\'',
+      "",
+      "# Get admin password",
+      "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d",
+      "",
+      "# Get UI URL",
+      "kubectl get svc argocd-server -n argocd -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'",
+      "",
+      "# Login via CLI",
+      "ARGOCD_URL=$(kubectl get svc argocd-server -n argocd -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')",
+      "argocd login \${ARGOCD_URL} --username admin --password PASTE_PASSWORD --insecure",
+      "",
+      "# Register the workload cluster",
+      "argocd cluster add workload --name streamcore-workload",
+      "argocd cluster list  # should show both in-cluster and streamcore-workload",
+    ],
+    expect: "ArgoCD UI accessible. Two clusters registered: in-cluster (mgmt) and streamcore-workload.",
+    tools: ["ArgoCD", "kubectl"],
+  },
+  {
+    phase: "GITOPS",
+    phaseColor: "#A855F7",
+    id: "2.2",
+    title: "App of Apps GitOps Structure",
+    why: "App of Apps is the standard ArgoCD pattern at scale. One root Application points to a folder of Application manifests. When you push a new Application YAML to Git, ArgoCD automatically picks it up and starts syncing. You never manually register apps in ArgoCD — Git is always the source of intent.",
+    commands: [
+      "# Create your GitOps repo structure",
+      "mkdir -p gitops/{apps,platform,workloads/{user-service,content-service,rabbitmq,redis}}",
+      "",
+      "# Root application (gitops/root-app.yaml)",
+      'cat > gitops/root-app.yaml << \'EOF\'',
+      'apiVersion: argoproj.io/v1alpha1',
+      'kind: Application',
+      'metadata:',
+      '  name: root',
+      '  namespace: argocd',
+      '  finalizers: [resources-finalizer.argocd.argoproj.io]',
+      'spec:',
+      '  project: default',
+      '  source:',
+      '    repoURL: https://github.com/YOUR_ORG/streamcore-gitops',
+      '    targetRevision: main',
+      '    path: apps',
+      '  destination:',
+      '    server: https://kubernetes.default.svc',
+      '    namespace: argocd',
+      '  syncPolicy:',
+      '    automated:',
+      '      prune: true',
+      '      selfHeal: true',
+      'EOF',
+      "",
+      "# Each file in gitops/apps/ is a child Application",
+      "# Example: gitops/apps/rabbitmq.yaml",
+      'cat > gitops/apps/rabbitmq.yaml << \'EOF\'',
+      'apiVersion: argoproj.io/v1alpha1',
+      'kind: Application',
+      'metadata:',
+      '  name: rabbitmq',
+      '  namespace: argocd',
+      'spec:',
+      '  project: default',
+      '  source:',
+      '    repoURL: https://github.com/YOUR_ORG/streamcore-gitops',
+      '    targetRevision: main',
+      '    path: workloads/rabbitmq',
+      '  destination:',
+      '    server: https://streamcore-workload-api-endpoint.region.eks.amazonaws.com',
+      '    namespace: messaging',
+      '  syncPolicy:',
+      '    automated:',
+      '      prune: true',
+      '      selfHeal: true',
+      '    syncOptions: [CreateNamespace=true]',
+      'EOF',
+      "",
+      "# Push to GitHub and apply root app",
+      "git add . && git commit -m 'init gitops structure' && git push",
+      "kubectl apply -f gitops/root-app.yaml",
+      "argocd app list  # root app appears, discovers child apps automatically",
+    ],
+    expect: "Root app synced. Child apps auto-discovered. ArgoCD dashboard shows all apps.",
+    tools: ["ArgoCD", "Git", "GitHub"],
+  },
+
+  // ─── PHASE 3: KARPENTER FINOPS ───────────────────────────────────────────
+  {
+    phase: "FINOPS",
+    phaseColor: "#FACC15",
+    id: "3.1",
+    title: "Karpenter — On-Demand + Spot NodePools",
+    why: "Karpenter replaces Cluster Autoscaler. It provisions nodes in 30 seconds vs 3 minutes and terminates them immediately when no longer needed. Two NodePools: on-demand for stateful/critical workloads (RabbitMQ consumers, the web tier), spot for stateless burst traffic (API servers, background jobs). You save 60-70% on EC2 costs. Karpenter also auto-selects the cheapest available instance type across families.",
+    commands: [
+      "kubectl config use-context workload",
+      "",
+      "# Install Karpenter via Helm (on workload cluster)",
+      "helm repo add karpenter https://charts.karpenter.sh/",
+      "helm install karpenter oci://public.ecr.aws/karpenter/karpenter \\",
+      "  --version 0.37.0 \\",
+      "  --namespace kube-system \\",
+      "  --set settings.clusterName=streamcore-workload \\",
+      "  --set settings.interruptionQueue=streamcore-workload \\",
+      "  --set controller.resources.requests.cpu=250m \\",
+      "  --set controller.resources.requests.memory=256Mi",
+      "",
+      "# On-demand NodePool — stable workloads",
+      'cat > gitops/platform/nodepool-ondemand.yaml << \'EOF\'',
+      'apiVersion: karpenter.sh/v1beta1',
+      'kind: NodePool',
+      'metadata:',
+      '  name: on-demand',
+      'spec:',
+      '  template:',
+      '    metadata:',
+      '      labels:',
+      '        billing/team: platform',
+      '        karpenter.sh/capacity-type: on-demand',
+      '    spec:',
+      '      nodeClassRef:',
+      '        name: streamcore',
+      '      requirements:',
+      '        - key: karpenter.sh/capacity-type',
+      '          operator: In',
+      '          values: ["on-demand"]',
+      '        - key: karpenter.k8s.aws/instance-family',
+      '          operator: In',
+      '          values: ["t3", "t3a", "m5", "m5a"]',
+      '        - key: karpenter.k8s.aws/instance-size',
+      '          operator: NotIn',
+      '          values: ["nano", "micro"]',
+      '      taints: []',
+      '  limits:',
+      '    cpu: "20"',
+      '    memory: 40Gi',
+      '  disruption:',
+      '    consolidationPolicy: WhenUnderutilized',
+      '    consolidateAfter: 30s',
+      '---',
+      'apiVersion: karpenter.sh/v1beta1',
+      'kind: NodePool',
+      'metadata:',
+      '  name: spot',
+      'spec:',
+      '  template:',
+      '    metadata:',
+      '      labels:',
+      '        billing/team: app',
+      '        karpenter.sh/capacity-type: spot',
+      '    spec:',
+      '      nodeClassRef:',
+      '        name: streamcore',
+      '      requirements:',
+      '        - key: karpenter.sh/capacity-type',
+      '          operator: In',
+      '          values: ["spot"]',
+      '        - key: karpenter.k8s.aws/instance-family',
+      '          operator: In',
+      '          values: ["t3", "t3a", "m5", "m5a", "m4"]',
+      '      taints:',
+      '        - key: spot',
+      '          effect: NoSchedule',
+      '  limits:',
+      '    cpu: "40"',
+      '  disruption:',
+      '    consolidationPolicy: WhenEmpty',
+      '    consolidateAfter: 60s',
+      'EOF',
+      "",
+      "kubectl apply -f gitops/platform/nodepool-ondemand.yaml",
+    ],
+    expect: "Two NodePools registered. Karpenter pod running. Nodes provision when pods are scheduled.",
+    tools: ["Karpenter", "Helm", "kubectl"],
+  },
+  {
+    phase: "FINOPS",
+    phaseColor: "#FACC15",
+    id: "3.2",
+    title: "Cost Tagging Strategy + AWS Budget Alerts",
+    why: "Tagging is the foundation of FinOps. Without tags you have one AWS bill. With tags you have per-team, per-service cost attribution. Set this up before deploying anything or you'll spend weeks retroactively tagging. Budget alerts fire before you exceed limits — not after. $300 is roughly the cost of running this stack, so alert at $250 to give yourself time to react.",
+    commands: [
+      "# Enforce tags on all resources via AWS Config",
+      '# infra/finops/main.tf',
+      'cat > infra/finops/main.tf << \'TFEOF\'',
+      '# AWS Budget: alert at 80% of $300/month',
+      'resource "aws_budgets_budget" "streamcore" {',
+      '  name         = "streamcore-monthly"',
+      '  budget_type  = "COST"',
+      '  limit_amount = "300"',
+      '  limit_unit   = "USD"',
+      '  time_unit    = "MONTHLY"',
+      '',
+      '  notification {',
+      '    comparison_operator        = "GREATER_THAN"',
+      '    threshold                  = 80',
+      '    threshold_type             = "PERCENTAGE"',
+      '    notification_type          = "ACTUAL"',
+      '    subscriber_email_addresses = ["your@email.com"]',
+      '  }',
+      '  notification {',
+      '    comparison_operator        = "GREATER_THAN"',
+      '    threshold                  = 100',
+      '    threshold_type             = "PERCENTAGE"',
+      '    notification_type          = "FORECASTED"',
+      '    subscriber_email_addresses = ["your@email.com"]',
+      '  }',
+      '}',
+      '',
+      '# Cost Allocation Tags',
+      'resource "aws_ce_cost_allocation_tag" "project" {',
+      '  tag_key = "Project"',
+      '  status  = "Active"',
+      '}',
+      'resource "aws_ce_cost_allocation_tag" "team" {',
+      '  tag_key = "Team"',
+      '  status  = "Active"',
+      '}',
+      'resource "aws_ce_cost_allocation_tag" "env" {',
+      '  tag_key = "Environment"',
+      '  status  = "Active"',
+      '}',
+      'TFEOF',
+      "",
+      "# Tag all k8s nodes with team via Karpenter labels",
+      "# (done above in NodePool metadata.labels)",
+      "",
+      "# View current spend breakdown",
+      "aws ce get-cost-and-usage \\",
+      "  --time-period Start=2024-01-01,End=2024-01-31 \\",
+      "  --granularity MONTHLY \\",
+      "  --metrics BlendedCost \\",
+      "  --group-by Type=TAG,Key=Project",
+    ],
+    expect: "Budget alerts configured. Cost allocation tags active. Monthly spend visible per Project/Team.",
+    tools: ["AWS Budgets", "Cost Explorer", "Terraform"],
+  },
+
+  // ─── PHASE 4: ISTIO SERVICE MESH ─────────────────────────────────────────
+  {
+    phase: "SERVICE MESH",
+    phaseColor: "#FF6B35",
+    id: "4.1",
+    title: "Install Istio on Both Clusters (Multi-Primary)",
+    why: "Multi-primary Istio means both clusters run their own Istio control plane (istiod) but share service discovery. A service in the workload cluster can call a service in the management cluster and Istio handles the routing, load balancing, and mTLS transparently. This is more resilient than a single control plane — if the management cluster has issues, the workload cluster keeps serving traffic.",
+    commands: [
+      "curl -L https://istio.io/downloadIstio | ISTIO_VERSION=1.21.0 sh -",
+      "export PATH=\${PWD}/istio-1.21.0/bin:\${PATH}",
+      "",
+      "# Install on MANAGEMENT cluster",
+      "kubectl config use-context mgmt",
+      'istioctl install -y -f - << \'EOF\'',
+      'apiVersion: install.istio.io/v1alpha1',
+      'kind: IstioOperator',
+      'spec:',
+      '  values:',
+      '    global:',
+      '      meshID: streamcore-mesh',
+      '      multiCluster:',
+      '        clusterName: streamcore-mgmt',
+      '      network: network1',
+      '  components:',
+      '    ingressGateways:',
+      '      - name: istio-ingressgateway',
+      '        enabled: true',
+      '        k8s:',
+      '          service:',
+      '            type: LoadBalancer',
+      'EOF',
+      "",
+      "# Install on WORKLOAD cluster",
+      "kubectl config use-context workload",
+      'istioctl install -y -f - << \'EOF\'',
+      'apiVersion: install.istio.io/v1alpha1',
+      'kind: IstioOperator',
+      'spec:',
+      '  values:',
+      '    global:',
+      '      meshID: streamcore-mesh',
+      '      multiCluster:',
+      '        clusterName: streamcore-workload',
+      '      network: network1',
+      'EOF',
+      "",
+      "# Enable sidecar injection on app namespaces",
+      "for ns in user-service content-service messaging caching; do",
+      "  kubectl --context=workload create namespace \${ns} --dry-run=client -o yaml | kubectl apply -f -",
+      "  kubectl --context=workload label namespace \${ns} istio-injection=enabled",
+      "done",
+    ],
+    expect: "istiod running on both clusters. Namespaces labelled for injection. Ingress gateway has external IP.",
+    tools: ["Istio", "istioctl"],
+  },
+  {
+    phase: "SERVICE MESH",
+    phaseColor: "#FF6B35",
+    id: "4.2",
+    title: "Enforce STRICT mTLS + Traffic Policies",
+    why: "STRICT mTLS means every pod-to-pod call is encrypted and mutually authenticated — no service can call another without a valid Istio-issued certificate. This replaces network-level security (VPN, security groups between pods) with identity-based security. Circuit breakers prevent a slow downstream service from cascading failures upstream. A 500ms timeout with 3 retries is the correct baseline for an API-serving microservice.",
+    commands: [
+      "kubectl config use-context workload",
+      "",
+      "# Enforce STRICT mTLS cluster-wide",
+      'kubectl apply -f - << \'EOF\'',
+      'apiVersion: security.istio.io/v1beta1',
+      'kind: PeerAuthentication',
+      'metadata:',
+      '  name: default',
+      '  namespace: istio-system',
+      'spec:',
+      '  mtls:',
+      '    mode: STRICT',
+      'EOF',
+      "",
+      "# Default traffic policy for all services",
+      '# gitops/platform/istio-defaults.yaml',
+      'cat > gitops/platform/istio-defaults.yaml << \'EOF\'',
+      'apiVersion: networking.istio.io/v1alpha3',
+      'kind: DestinationRule',
+      'metadata:',
+      '  name: default-circuit-breaker',
+      '  namespace: istio-system',
+      'spec:',
+      '  host: "*.svc.cluster.local"',
+      '  trafficPolicy:',
+      '    connectionPool:',
+      '      tcp:',
+      '        maxConnections: 100',
+      '      http:',
+      '        http1MaxPendingRequests: 50',
+      '        http2MaxRequests: 500',
+      '    outlierDetection:',
+      '      consecutive5xxErrors: 5',
+      '      interval: 30s',
+      '      baseEjectionTime: 30s',
+      '      maxEjectionPercent: 50',
+      '---',
+      'apiVersion: networking.istio.io/v1alpha3',
+      'kind: VirtualService',
+      'metadata:',
+      '  name: default-retry-policy',
+      '  namespace: istio-system',
+      'spec:',
+      '  hosts: ["*"]',
+      '  http:',
+      '    - timeout: 10s',
+      '      retries:',
+      '        attempts: 3',
+      '        perTryTimeout: 3s',
+      '        retryOn: 5xx,gateway-error,reset,connect-failure',
+      'EOF',
+      "",
+      "kubectl apply -f gitops/platform/istio-defaults.yaml",
+      "",
+      "# Verify mTLS is enforced",
+      "istioctl x check-inject -n user-service",
+      "kubectl get peerauthentication --all-namespaces",
+    ],
+    expect: "PeerAuthentication STRICT mode active. Circuit breaker rules applied globally. All namespaces show mtls=strict.",
+    tools: ["Istio", "kubectl"],
+  },
+
+  // ─── PHASE 5: DATA LAYER ─────────────────────────────────────────────────
+  {
+    phase: "DATA LAYER",
+    phaseColor: "#38BDF8",
+    id: "5.1",
+    title: "RDS MySQL — Free Tier (db.t3.micro)",
+    why: "db.t3.micro with 20GB gp2 storage qualifies for AWS Free Tier (750 hours/month free for 12 months). This is enough for development and light production. Single-AZ because the free tier doesn't cover Multi-AZ standby — acceptable for dev, but document this as a known risk. The security group only allows connections from the private subnet CIDR, so RDS is never directly reachable from the internet.",
+    commands: [
+      "# infra/rds/main.tf",
+      'cat > infra/rds/main.tf << \'TFEOF\'',
+      'data "terraform_remote_state" "vpc" {',
+      '  backend = "s3"',
+      '  config = {',
+      '    bucket = "streamcore-tfstate-ACCOUNT_ID"',
+      '    key    = "vpc/terraform.tfstate"',
+      '    region = "us-east-1"',
+      '  }',
+      '}',
+      '',
+      'resource "aws_security_group" "rds" {',
+      '  name   = "streamcore-rds"',
+      '  vpc_id = data.terraform_remote_state.vpc.outputs.vpc_id',
+      '  ingress {',
+      '    from_port   = 3306',
+      '    to_port     = 3306',
+      '    protocol    = "tcp"',
+      '    cidr_blocks = ["10.0.0.0/16"]  # VPC CIDR only',
+      '  }',
+      '}',
+      '',
+      'resource "aws_db_subnet_group" "main" {',
+      '  name       = "streamcore"',
+      '  subnet_ids = data.terraform_remote_state.vpc.outputs.private_subnet_ids',
+      '}',
+      '',
+      'resource "aws_db_instance" "main" {',
+      '  identifier        = "streamcore-mysql"',
+      '  engine            = "mysql"',
+      '  engine_version    = "8.0"',
+      '  instance_class    = "db.t3.micro"  # FREE TIER',
+      '  allocated_storage = 20             # FREE TIER max',
+      '  storage_type      = "gp2"',
+      '  db_name           = "streamcore"',
+      '  username          = "admin"',
+      '  password          = var.db_password',
+      '  port              = 3306',
+      '  multi_az                = false  # free tier: no multi-AZ',
+      '  publicly_accessible     = false',
+      '  skip_final_snapshot     = true',
+      '  backup_retention_period = 3',
+      '  deletion_protection     = false',
+      '  db_subnet_group_name    = aws_db_subnet_group.main.name',
+      '  vpc_security_group_ids  = [aws_security_group.rds.id]',
+      '  tags = {',
+      '    Project     = "streamcore"',
+      '    Environment = "dev"',
+      '    CostNote    = "free-tier-eligible"',
+      '  }',
+      '}',
+      '',
+      'output "rds_endpoint" { value = aws_db_instance.main.address }',
+      'TFEOF',
+      "",
+      "cd infra/rds && terraform init",
+      "terraform apply -var='db_password=SecurePass123!' -auto-approve",
+      "",
+      "# Store RDS credentials in AWS Secrets Manager",
+      "aws secretsmanager create-secret \\",
+      "  --name streamcore/rds/credentials \\",
+      '  --secret-string \'{"username":"admin","password":"SecurePass123!","host":"PASTE_RDS_ENDPOINT","port":"3306","database":"streamcore"}\'',
+    ],
+    expect: "RDS MySQL db.t3.micro running. Endpoint stored in Secrets Manager. Not publicly accessible.",
+    tools: ["AWS RDS", "Terraform", "Secrets Manager"],
+  },
+  {
+    phase: "DATA LAYER",
+    phaseColor: "#38BDF8",
+    id: "5.2",
+    title: "ElastiCache Redis — Query Caching (cache.t3.micro)",
+    why: "Query caching eliminates repeated database hits for read-heavy data. User profiles, product listings, session data — once fetched and cached, subsequent requests are served in <1ms from Redis vs 10-50ms from RDS. cache.t3.micro is free tier eligible. The caching strategy is cache-aside: application checks Redis first, falls back to RDS on cache miss, then populates Redis for next time. TTL of 5 minutes balances freshness vs performance.",
+    commands: [
+      "# infra/redis/main.tf",
+      'cat > infra/redis/main.tf << \'TFEOF\'',
+      'resource "aws_security_group" "redis" {',
+      '  name   = "streamcore-redis"',
+      '  vpc_id = data.terraform_remote_state.vpc.outputs.vpc_id',
+      '  ingress {',
+      '    from_port   = 6379',
+      '    to_port     = 6379',
+      '    protocol    = "tcp"',
+      '    cidr_blocks = ["10.0.0.0/16"]',
+      '  }',
+      '}',
+      '',
+      'resource "aws_elasticache_subnet_group" "main" {',
+      '  name       = "streamcore"',
+      '  subnet_ids = data.terraform_remote_state.vpc.outputs.private_subnet_ids',
+      '}',
+      '',
+      'resource "aws_elasticache_cluster" "main" {',
+      '  cluster_id           = "streamcore-redis"',
+      '  engine               = "redis"',
+      '  node_type            = "cache.t3.micro"  # FREE TIER eligible',
+      '  num_cache_nodes      = 1',
+      '  parameter_group_name = "default.redis7"',
+      '  engine_version       = "7.1"',
+      '  port                 = 6379',
+      '  subnet_group_name    = aws_elasticache_subnet_group.main.name',
+      '  security_group_ids   = [aws_security_group.redis.id]',
+      '  tags = {',
+      '    Project = "streamcore"',
+      '    Purpose = "query-cache"',
+      '  }',
+      '}',
+      'output "redis_endpoint" { value = aws_elasticache_cluster.main.cache_nodes[0].address }',
+      'TFEOF',
+      "",
+      "cd infra/redis && terraform init && terraform apply -auto-approve",
+      "",
+      "# Cache-aside pattern in your Node.js service:",
+      '# const cached = await redis.get("user:" + userId);',
+      '# if (cached) return JSON.parse(cached);',
+      '# const user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);',
+      '# await redis.setex("user:" + userId, 300, JSON.stringify(user));  // 5 min TTL',
+      '# return user;',
+    ],
+    expect: "Redis cache.t3.micro running. Endpoint reachable from k8s pods in VPC. Cache-aside pattern implemented.",
+    tools: ["ElastiCache", "Redis", "Terraform"],
+  },
+  {
+    phase: "DATA LAYER",
+    phaseColor: "#38BDF8",
+    id: "5.3",
+    title: "RabbitMQ on Kubernetes (Self-Hosted)",
+    why: "RabbitMQ on k8s instead of Amazon MQ saves ~$80/month. The RabbitMQ Cluster Operator manages the lifecycle, rolling upgrades, and pod disruption handling. We use it for async operations: order processing, email notifications, inventory updates — anything that doesn't need an immediate response. Three replicas with quorum queues means messages survive a single node failure. Istio mTLS protects all RabbitMQ traffic without changing any app code.",
+    commands: [
+      "kubectl config use-context workload",
+      "",
+      "# Install RabbitMQ Cluster Operator",
+      "kubectl apply -f https://github.com/rabbitmq/cluster-operator/releases/latest/download/cluster-operator.yml",
+      "kubectl wait --for=condition=available deployment/rabbitmq-cluster-operator \\",
+      "  -n rabbitmq-system --timeout=120s",
+      "",
+      "# gitops/workloads/rabbitmq/cluster.yaml",
+      'cat > gitops/workloads/rabbitmq/cluster.yaml << \'EOF\'',
+      'apiVersion: rabbitmq.com/v1beta1',
+      'kind: RabbitmqCluster',
+      'metadata:',
+      '  name: streamcore',
+      '  namespace: messaging',
+      'spec:',
+      '  replicas: 3',
+      '  image: rabbitmq:3.13-management',
+      '  resources:',
+      '    requests:',
+      '      cpu: 200m',
+      '      memory: 512Mi',
+      '    limits:',
+      '      cpu: 1000m',
+      '      memory: 1Gi',
+      '  rabbitmq:',
+      '    additionalConfig: |',
+      '      cluster_partition_handling = pause_minority',
+      '      vm_memory_high_watermark_paging_ratio = 0.99',
+      '      disk_free_limit.relative = 1.0',
+      '  persistence:',
+      '    storageClassName: gp2',
+      '    storage: 10Gi',
+      '  service:',
+      '    type: ClusterIP',
+      'EOF',
+      "",
+      "# Push to git, ArgoCD deploys automatically",
+      "git add gitops/workloads/rabbitmq/ && git commit -m 'add rabbitmq cluster' && git push",
+      "",
+      "# Verify after ArgoCD syncs (2-3 mins)",
+      "kubectl get rabbitmqcluster -n messaging",
+      "kubectl get pods -n messaging",
+      "",
+      "# Get default credentials",
+      "kubectl get secret streamcore-default-user -n messaging \\",
+      "  -o jsonpath='{.data.username}' | base64 -d",
+      "kubectl get secret streamcore-default-user -n messaging \\",
+      "  -o jsonpath='{.data.password}' | base64 -d",
+      "",
+      "# Port forward management UI",
+      "kubectl port-forward svc/streamcore -n messaging 15672:15672",
+      "# Open http://localhost:15672",
+    ],
+    expect: "3-replica RabbitMQ cluster running with persistent storage. Management UI accessible. All pods Ready.",
+    tools: ["RabbitMQ Operator", "kubectl", "ArgoCD"],
+  },
+
+  // ─── PHASE 6: SERVICES DEPLOYMENT ────────────────────────────────────────
+  {
+    phase: "SERVICES",
+    phaseColor: "#00FFB2",
+    id: "6.1",
+    title: "Deploy Microservices via ArgoCD",
+    why: "Every service deployment is a Git commit. The Deployment YAML references a specific image tag — not 'latest'. When GitHub Actions builds a new image and pushes to ECR, it updates the image tag in the GitOps repo via a commit. ArgoCD detects the change and rolls out the new version. This means your deployment history is your Git log and rollback is git revert.",
+    commands: [
+      "# Example: User Service deployment in GitOps repo",
+      '# gitops/workloads/user-service/deployment.yaml',
+      'cat > gitops/workloads/user-service/deployment.yaml << \'EOF\'',
+      'apiVersion: apps/v1',
+      'kind: Deployment',
+      'metadata:',
+      '  name: user-service',
+      '  namespace: user-service',
+      '  labels:',
+      '    app: user-service',
+      '    version: v1',
+      '    billing/team: backend',
+      '    billing/service: user',
+      'spec:',
+      '  replicas: 2',
+      '  selector:',
+      '    matchLabels:',
+      '      app: user-service',
+      '  strategy:',
+      '    type: RollingUpdate',
+      '    rollingUpdate:',
+      '      maxUnavailable: 0',
+      '      maxSurge: 1',
+      '  template:',
+      '    metadata:',
+      '      labels:',
+      '        app: user-service',
+      '        version: v1',
+      '      annotations:',
+      '        prometheus.io/scrape: "true"',
+      '        prometheus.io/port: "3000"',
+      '    spec:',
+      '      serviceAccountName: user-service',
+      '      containers:',
+      '        - name: user-service',
+      '          image: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/streamcore/user-service:SHA_HERE',
+      '          ports:',
+      '            - containerPort: 3000',
+      '          env:',
+      '            - name: DB_HOST',
+      '              valueFrom:',
+      '                secretKeyRef:',
+      '                  name: rds-credentials',
+      '                  key: host',
+      '            - name: REDIS_HOST',
+      '              value: "REDIS_ENDPOINT_HERE"',
+      '            - name: RABBITMQ_URL',
+      '              value: "amqp://streamcore.messaging.svc.cluster.local:5672"',
+      '          resources:',
+      '            requests: { cpu: "100m", memory: "128Mi" }',
+      '            limits:   { cpu: "500m", memory: "512Mi" }',
+      '          readinessProbe:',
+      '            httpGet: { path: /health, port: 3000 }',
+      '            initialDelaySeconds: 10',
+      'EOF',
+      "",
+      "# GitHub Actions auto-updates image tag on push:",
+      '# sed -i "s|image: .*user-service:.*|image: REGISTRY/user-service:GIT_SHA|" \\',
+      '# gitops/workloads/user-service/deployment.yaml',
+      "# git commit -am 'deploy user-service:GIT_SHA'",
+      "# git push",
+      "# ArgoCD syncs automatically within 3 minutes",
+    ],
+    expect: "Services deployed via ArgoCD. Pods running with Istio sidecars injected. RabbitMQ URL reachable.",
+    tools: ["ArgoCD", "GitHub Actions", "ECR"],
+  },
+  {
+    phase: "SERVICES",
+    phaseColor: "#00FFB2",
+    id: "6.2",
+    title: "Istio Ingress Gateway + HTTPS",
+    why: "The Istio Ingress Gateway is the single entry point for all external traffic. It terminates TLS, applies rate limiting, and routes traffic to services based on hostname and path. All internal traffic between services stays within the mesh encrypted via mTLS — TLS is only terminated at the edge. This gives you one place to manage external traffic policy instead of per-service Ingress rules.",
+    commands: [
+      "kubectl config use-context workload",
+      "",
+      "# Get ingress gateway external IP",
+      "kubectl get svc istio-ingressgateway -n istio-system",
+      "",
+      "# Create Gateway + VirtualService for routing",
+      'cat > gitops/platform/gateway.yaml << \'EOF\'',
+      'apiVersion: networking.istio.io/v1alpha3',
+      'kind: Gateway',
+      'metadata:',
+      '  name: streamcore-gateway',
+      '  namespace: istio-system',
+      'spec:',
+      '  selector:',
+      '    istio: ingressgateway',
+      '  servers:',
+      '    - port:',
+      '        number: 80',
+      '        name: http',
+      '        protocol: HTTP',
+      '      hosts: ["api.streamcore.com"]',
+      '      tls:',
+      '        httpsRedirect: true',
+      '    - port:',
+      '        number: 443',
+      '        name: https',
+      '        protocol: HTTPS',
+      '      tls:',
+      '        mode: SIMPLE',
+      '        credentialName: streamcore-tls',
+      '      hosts: ["api.streamcore.com"]',
+      '---',
+      'apiVersion: networking.istio.io/v1alpha3',
+      'kind: VirtualService',
+      'metadata:',
+      '  name: streamcore-routes',
+      '  namespace: istio-system',
+      'spec:',
+      '  hosts: ["api.streamcore.com"]',
+      '  gateways: ["streamcore-gateway"]',
+      '  http:',
+      '    - match:',
+      '        - uri: { prefix: "/users" }',
+      '      route:',
+      '        - destination:',
+      '            host: user-service.user-service.svc.cluster.local',
+      '            port: { number: 80 }',
+      '    - match:',
+      '        - uri: { prefix: "/content" }',
+      '      route:',
+      '        - destination:',
+      '            host: content-service.content-service.svc.cluster.local',
+      '            port: { number: 80 }',
+      'EOF',
+      "",
+      "kubectl apply -f gitops/platform/gateway.yaml",
+      "",
+      "# Point your domain to the gateway external IP via Route53",
+      "# Then create TLS secret from cert-manager",
+      "kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml",
+    ],
+    expect: "Gateway running. HTTP redirects to HTTPS. Routes to user-service and content-service working.",
+    tools: ["Istio Gateway", "cert-manager"],
+  },
+
+  // ─── PHASE 7: LOGGING ────────────────────────────────────────────────────
+  {
+    phase: "LOGGING",
+    phaseColor: "#A855F7",
+    id: "7.1",
+    title: "Loki + Promtail — Centralized Logging Stack",
+    why: "Loki is Grafana's log aggregation system. It stores logs indexed only by labels (namespace, pod, service) not the full text — this is 10x cheaper than Elasticsearch. Promtail runs as a DaemonSet on every node, tails container logs, and ships them to Loki. You query logs in Grafana using LogQL, the same Grafana instance you already use for metrics. One dashboard for logs, metrics, and traces.",
+    commands: [
+      "kubectl config use-context workload",
+      "",
+      "# Install Loki stack via Helm",
+      "helm repo add grafana https://grafana.github.io/helm-charts",
+      "",
+      'cat > gitops/platform/loki-values.yaml << \'EOF\'',
+      'loki:',
+      '  commonConfig:',
+      '    replication_factor: 1   # single replica for dev cost saving',
+      '  storage:',
+      '    type: filesystem        # use S3 in prod: type: s3',
+      '  schemaConfig:',
+      '    configs:',
+      '      - from: "2024-01-01"',
+      '        store: tsdb',
+      '        object_store: filesystem',
+      '        schema: v13',
+      '        index:',
+      '          prefix: index_',
+      '          period: 24h',
+      '  limits_config:',
+      '    retention_period: 168h  # 7 days retention',
+      '    ingestion_rate_mb: 10',
+      '    max_streams_per_user: 10000',
+      'promtail:',
+      '  config:',
+      '    clients:',
+      '      - url: http://loki-gateway.monitoring.svc.cluster.local/loki/api/v1/push',
+      '    snippets:',
+      '      pipelineStages:',
+      '        - json:',
+      '            expressions:',
+      '              level: level',
+      '              correlation_id: correlation_id',
+      '              service: service',
+      '        - labels:',
+      '            level:',
+      '            correlation_id:',
+      '            service:',
+      'grafana:',
+      '  enabled: true',
+      '  adminPassword: changeme-in-prod',
+      '  datasources:',
+      '    datasources.yaml:',
+      '      apiVersion: 1',
+      '      datasources:',
+      '        - name: Loki',
+      '          type: loki',
+      '          url: http://loki-gateway.monitoring.svc.cluster.local',
+      '          isDefault: false',
+      'EOF',
+      "",
+      "helm install loki grafana/loki-stack \\",
+      "  --namespace monitoring --create-namespace \\",
+      "  -f gitops/platform/loki-values.yaml",
+      "",
+      "# Access Grafana",
+      "kubectl port-forward svc/loki-grafana 3000:80 -n monitoring",
+      "# http://localhost:3000 — admin / changeme-in-prod",
+      "",
+      "# Example LogQL queries in Grafana:",
+      '# {namespace="user-service"} | json | level="error"',
+      '# {app="user-service"} | json | correlation_id="abc-123"  ← trace a request',
+      '# rate({namespace="user-service"}[5m])  ← log volume over time',
+    ],
+    expect: "Loki running. Promtail DaemonSet on all nodes. Logs visible in Grafana. LogQL queries working.",
+    tools: ["Loki", "Promtail", "Grafana", "Helm"],
+  },
+  {
+    phase: "LOGGING",
+    phaseColor: "#A855F7",
+    id: "7.2",
+    title: "Structured Logging + Correlation IDs",
+    why: "Structured JSON logs are queryable. Plain text logs are not. A correlation ID added at the gateway and propagated through every service call lets you reconstruct the complete journey of one user request across 6 microservices in Grafana — single LogQL query. Without this, debugging a production issue means grepping through millions of unrelated log lines.",
+    commands: [
+      "# Add to your Node.js services:",
+      "# npm install pino pino-http uuid",
+      "",
+      '# src/logger.js',
+      'cat > src/logger.js << \'EOF\'',
+      'const pino = require("pino");',
+      '',
+      'const logger = pino({',
+      '  level: process.env.LOG_LEVEL || "info",',
+      '  formatters: {',
+      '    level: (label) => ({ level: label }),',
+      '  },',
+      '  base: {',
+      '    service: process.env.SERVICE_NAME,',
+      '    version: process.env.APP_VERSION,',
+      '    env: process.env.NODE_ENV,',
+      '  },',
+      '});',
+      '',
+      'module.exports = logger;',
+      'EOF',
+      "",
+      '# src/middleware/correlationId.js',
+      'cat > src/middleware/correlationId.js << \'EOF\'',
+      'const { v4: uuidv4 } = require("uuid");',
+      '',
+      'module.exports = (req, res, next) => {',
+      '  // Accept from upstream (propagate) or generate new',
+      '  req.correlationId = req.headers["x-correlation-id"] || uuidv4();',
+      '  res.setHeader("x-correlation-id", req.correlationId);',
+      '',
+      '  // Attach to all logs in this request',
+      '  req.log = logger.child({ correlation_id: req.correlationId });',
+      '  next();',
+      '};',
+      'EOF',
+      "",
+      "# Pass correlation ID to downstream services:",
+      '# axios.get(url, {',
+      '#   headers: { "x-correlation-id": req.correlationId }',
+      '# });',
+      "",
+      "# Pass to RabbitMQ messages:",
+      '# channel.sendToQueue(queue, Buffer.from(JSON.stringify({',
+      '#   ...payload,',
+      '#   _metadata: { correlation_id: req.correlationId, timestamp: Date.now() }',
+      '# })));',
+    ],
+    expect: "All services logging JSON. Correlation IDs visible in Grafana logs. Single request traceable across services.",
+    tools: ["Pino", "Node.js", "Grafana"],
+  },
+
+  // ─── PHASE 8: OBSERVABILITY ──────────────────────────────────────────────
+  {
+    phase: "OBSERVABILITY",
+    phaseColor: "#FF6B35",
+    id: "8.1",
+    title: "Prometheus + Grafana — Metrics Stack",
+    why: "Prometheus scrapes metrics from every pod annotated with prometheus.io/scrape=true. kube-prometheus-stack includes rules for Kubernetes cluster health, node resource usage, and pod-level metrics out of the box. Grafana connects to both Prometheus and Loki so you have one tool for logs and metrics. Install on the management cluster so a workload cluster incident doesn't take down your visibility.",
+    commands: [
+      "kubectl config use-context mgmt",
+      "",
+      "helm repo add prometheus-community https://prometheus-community.github.io/helm-charts",
+      "",
+      'cat > gitops/platform/prometheus-values.yaml << \'EOF\'',
+      'grafana:',
+      '  adminPassword: changeme-in-prod',
+      '  ingress:',
+      '    enabled: true',
+      '    hosts: ["grafana.streamcore.com"]',
+      '',
+      'prometheus:',
+      '  prometheusSpec:',
+      '    retention: 15d',
+      '    externalLabels:',
+      '      cluster: streamcore-mgmt',
+      '    additionalScrapeConfigs:',
+      '      - job_name: workload-cluster-services',
+      '        kubernetes_sd_configs:',
+      '          - role: pod',
+      '            api_server: https://WORKLOAD_CLUSTER_ENDPOINT',
+      '            tls_config:',
+      '              ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+      '        relabel_configs:',
+      '          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]',
+      '            action: keep',
+      '            regex: "true"',
+      '',
+      'alertmanager:',
+      '  config:',
+      '    route:',
+      '      group_by: [alertname, namespace]',
+      '      receiver: slack-alerts',
+      '    receivers:',
+      '      - name: slack-alerts',
+      '        slack_configs:',
+      '          - api_url: YOUR_SLACK_WEBHOOK',
+      '            channel: "#alerts"',
+      '            title: "{{ .GroupLabels.alertname }}"',
+      '            text: "{{ .CommonAnnotations.description }}"',
+      'EOF',
+      "",
+      "helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \\",
+      "  --namespace monitoring --create-namespace \\",
+      "  -f gitops/platform/prometheus-values.yaml",
+      "",
+      "# Import dashboards: 1860 (node exporter), 315 (k8s cluster), 7362 (rabbitmq)",
+      "# In Grafana: Dashboards → Import → enter ID",
+    ],
+    expect: "Prometheus scraping both clusters. Grafana accessible. Node and pod metrics visible. Alerts routing to Slack.",
+    tools: ["Prometheus", "Grafana", "Alertmanager"],
+  },
+
+  // ─── PHASE 9: FINAL HARDENING ────────────────────────────────────────────
+  {
+    phase: "HARDENING",
+    phaseColor: "#FACC15",
+    id: "9.1",
+    title: "Network Policies — Zero-Trust Pod Communication",
+    why: "By default, every pod in Kubernetes can talk to every other pod. NetworkPolicies enforce that only intended traffic flows. User-service should never directly talk to the database — it goes through the data-service. RabbitMQ should only accept connections from services in the messaging namespace. This is defense-in-depth: if one pod is compromised, the blast radius is contained to what that pod is explicitly allowed to reach.",
+    commands: [
+      "# Deny all ingress/egress by default for app namespaces",
+      'cat > gitops/platform/network-policies.yaml << \'EOF\'',
+      'apiVersion: networking.k8s.io/v1',
+      'kind: NetworkPolicy',
+      'metadata:',
+      '  name: default-deny-all',
+      '  namespace: user-service',
+      'spec:',
+      '  podSelector: {}',
+      '  policyTypes: [Ingress, Egress]',
+      '---',
+      '# Allow user-service to accept traffic from Istio ingress gateway only',
+      'apiVersion: networking.k8s.io/v1',
+      'kind: NetworkPolicy',
+      'metadata:',
+      '  name: allow-from-gateway',
+      '  namespace: user-service',
+      'spec:',
+      '  podSelector:',
+      '    matchLabels:',
+      '      app: user-service',
+      '  policyTypes: [Ingress]',
+      '  ingress:',
+      '    - from:',
+      '        - namespaceSelector:',
+      '            matchLabels:',
+      '              kubernetes.io/metadata.name: istio-system',
+      '---',
+      '# Allow user-service egress to RDS and Redis only',
+      'apiVersion: networking.k8s.io/v1',
+      'kind: NetworkPolicy',
+      'metadata:',
+      '  name: allow-db-egress',
+      '  namespace: user-service',
+      'spec:',
+      '  podSelector:',
+      '    matchLabels:',
+      '      app: user-service',
+      '  policyTypes: [Egress]',
+      '  egress:',
+      '    - ports:',
+      '        - port: 3306   # MySQL RDS',
+      '        - port: 6379   # Redis',
+      '        - port: 5672   # RabbitMQ',
+      '        - port: 53     # DNS — always allow',
+      '        - port: 443    # HTTPS outbound',
+      'EOF',
+      "",
+      "kubectl apply -f gitops/platform/network-policies.yaml",
+      "",
+      "# Verify connectivity after applying",
+      "kubectl exec -n user-service deploy/user-service -- curl -s content-service.content-service.svc.cluster.local",
+      "# Should fail (blocked) unless you explicitly allow it",
+    ],
+    expect: "Default-deny in place. Services can only reach their explicitly allowed peers. Inter-service communication works via allowed paths.",
+    tools: ["Kubernetes NetworkPolicy", "kubectl"],
+  },
+  {
+    phase: "HARDENING",
+    phaseColor: "#FACC15",
+    id: "9.2",
+    title: "HPA + PDB — Auto-Scale with Zero Downtime",
+    why: "HPA scales pods up when CPU/memory is high and down when idle — automatic right-sizing. PDB (Pod Disruption Budget) guarantees at least 1 pod is always available during node drains, rolling updates, or Karpenter consolidation. Without PDB, a rolling update + simultaneous Karpenter node consolidation could take all pods offline at once. PDB is the safety net that ensures Kubernetes respects your availability requirements.",
+    commands: [
+      'cat > gitops/workloads/user-service/hpa-pdb.yaml << \'EOF\'',
+      'apiVersion: autoscaling/v2',
+      'kind: HorizontalPodAutoscaler',
+      'metadata:',
+      '  name: user-service',
+      '  namespace: user-service',
+      'spec:',
+      '  scaleTargetRef:',
+      '    apiVersion: apps/v1',
+      '    kind: Deployment',
+      '    name: user-service',
+      '  minReplicas: 2',
+      '  maxReplicas: 20',
+      '  metrics:',
+      '    - type: Resource',
+      '      resource:',
+      '        name: cpu',
+      '        target:',
+      '          type: Utilization',
+      '          averageUtilization: 70',
+      '    - type: Resource',
+      '      resource:',
+      '        name: memory',
+      '        target:',
+      '          type: Utilization',
+      '          averageUtilization: 80',
+      '  behavior:',
+      '    scaleDown:',
+      '      stabilizationWindowSeconds: 300  # wait 5min before scaling down',
+      '      policies:',
+      '        - type: Percent',
+      '          value: 25',
+      '          periodSeconds: 60             # scale down max 25% every 60s',
+      '    scaleUp:',
+      '      stabilizationWindowSeconds: 0    # scale up immediately',
+      '---',
+      'apiVersion: policy/v1',
+      'kind: PodDisruptionBudget',
+      'metadata:',
+      '  name: user-service-pdb',
+      '  namespace: user-service',
+      'spec:',
+      '  minAvailable: 1   # always keep at least 1 pod running',
+      '  selector:',
+      '    matchLabels:',
+      '      app: user-service',
+      'EOF',
+      "",
+      "git add . && git commit -m 'add HPA and PDB for user-service' && git push",
+      "# ArgoCD deploys automatically",
+      "",
+      "# Watch HPA in action",
+      "kubectl get hpa -n user-service --watch",
+      "",
+      "# Simulate load to trigger scale-up",
+      "kubectl run load-test --image=busybox --rm -it --restart=Never -- \\",
+      "  sh -c \"while true; do wget -q -O- http://user-service.user-service.svc.cluster.local/health; done\"",
+    ],
+    expect: "HPA scaling between 2-20 replicas based on CPU. PDB preventing disruptive pod terminations. Scale-up triggers within 60s of load.",
+    tools: ["HPA", "PDB", "kubectl"],
+  },
+  {
+    phase: "HARDENING",
+    phaseColor: "#FACC15",
+    id: "9.3",
+    title: "Estimated Monthly Cost Breakdown",
+    why: "CTO-level awareness: know your bill before it arrives. This stack is designed to stay under $200/month in dev. The two free-tier resources (RDS db.t3.micro and ElastiCache cache.t3.micro) eliminate the biggest database costs. Karpenter ensures you never pay for idle nodes. One NAT gateway instead of three saves $65/month. Spot instances on the workload cluster save 60-70% on EC2 costs.",
+    commands: [
+      "# Estimated monthly costs for this stack (us-east-1, dev environment)",
+      "#",
+      "# EKS Control Plane x2:           $144  ($72 each, unavoidable)",
+      "# EC2 — mgmt cluster (2x t3.medium spot):  ~$20",
+      "# EC2 — workload (Karpenter, ~4x t3.small): ~$25",
+      "# RDS db.t3.micro (FREE TIER):     $0   (first 12 months)",
+      "# ElastiCache cache.t3.micro FREE:  $0   (first 12 months)",
+      "# NAT Gateway (1x):                $35",
+      "# ALB (Istio Ingress):             $20",
+      "# S3 (TF state + logs):            $5",
+      "# Route53:                         $5",
+      "# Data transfer:                   ~$10",
+      "# ─────────────────────────────────────────",
+      "# TOTAL (yr1 free tier):          ~$264/month",
+      "# TOTAL (after free tier):        ~$330/month",
+      "#",
+      "# Savings vs naive setup:",
+      "# 1 NAT GW instead of 3:          -$65/month",
+      "# Spot for workload nodes:         -$40/month",
+      "# RabbitMQ on k8s vs Amazon MQ:   -$80/month",
+      "# ─────────────────────────────────────────",
+      "# SAVINGS:                        ~$185/month vs naive approach",
+      "",
+      "# Ongoing FinOps: view top 5 services by cost",
+      "aws ce get-cost-and-usage \\",
+      "  --time-period Start=2024-01-01,End=2024-01-31 \\",
+      "  --granularity MONTHLY \\",
+      "  --metrics UnblendedCost \\",
+      "  --group-by Type=SERVICE \\",
+      "  --query 'ResultsByTime[0].Groups | sort_by(@, &Metrics.UnblendedCost.Amount) | reverse(@) | [:5]'",
+    ],
+    expect: "Bill under $270/month in year 1. Alert fires before $240. Monthly review via AWS Cost Explorer.",
+    tools: ["AWS Cost Explorer", "AWS Budgets"],
+  },
 ];
 
-const CTO_PHASES=[
-  {id:"C1",week:"1–2",color:"#00FFB2",icon:"◈",title:"AWS Foundation & EKS Cluster",
-   goal:"Production AWS account, VPC, EKS cluster with all networking wired up.",
-   skills:["AWS account hardening: root lockdown, MFA, billing alerts","VPC: public/private subnets, NAT gateway, bastion","EKS via Terraform: managed node groups, IRSA, autoscaler","kubectl access, kubeconfig, namespaces strategy","AWS LB Controller + ExternalDNS + cert-manager"],
-   projects:[
-     {name:"Production VPC + EKS",desc:"Terraform: VPC 3 AZs, private/public subnets, EKS 1.29, managed node groups (spot + on-demand), cluster autoscaler.",hard:true},
-     {name:"Ingress Stack",desc:"AWS LB Controller + ExternalDNS (Route53) + cert-manager (Let's Encrypt). HTTPS on streamcore.yourdomain.com.",hard:false},
-   ],
-   tools:["Terraform","AWS EKS","kubectl","Helm","cert-manager"],
-   content:[
-     {title:"Key Concepts",type:"concept",items:[
-       {term:"EKS",def:"AWS-managed Kubernetes. AWS runs the control plane. You manage node groups. Use managed node groups for simplicity."},
-       {term:"IRSA",def:"IAM Roles for Service Accounts. Pods get AWS permissions via annotations. No static credentials ever."},
-       {term:"VPC CIDR Design",def:"Plan for growth: /16 VPC → /24 subnets per AZ. Private subnets for pods/DBs. Public for load balancers only."},
-       {term:"AWS LB Controller",def:"Creates ALB/NLB from Kubernetes Ingress/Service objects. AWS-native load balancing."},
-     ]},
-     {title:"Terraform: VPC + EKS",type:"code",lang:"bash",content:`# Project structure
-mkdir -p streamcore-infra/{modules/{vpc,eks,rds,redis},envs/{dev,staging,prod}}
-
-# Bootstrap S3 backend (run once)
-aws s3 mb s3://streamcore-tfstate --region us-east-1
-aws s3api put-bucket-versioning --bucket streamcore-tfstate \\
-  --versioning-configuration Status=Enabled
-aws dynamodb create-table --table-name streamcore-tflock \\
-  --attribute-definitions AttributeName=LockID,AttributeType=S \\
-  --key-schema AttributeName=LockID,KeyType=HASH \\
-  --billing-mode PAY_PER_REQUEST
-
-# VPC module (modules/vpc/main.tf)
-# Uses: terraform-aws-modules/vpc/aws ~> 5.0
-# Private subnets tagged for EKS internal-elb
-# Public subnets tagged for EKS elb
-
-# EKS module (modules/eks/main.tf)
-# Uses: terraform-aws-modules/eks/aws ~> 20.0
-# cluster_version = "1.29"
-# enable_irsa = true
-# Two node groups:
-#   system: m5.large on-demand, min 2 / max 4
-#   app: m5.xlarge SPOT, min 2 / max 20
-
-terraform init
-terraform plan -out=tfplan
-terraform apply tfplan`},
-     {title:"Ingress + TLS",type:"code",lang:"bash",content:`# Install AWS Load Balancer Controller
-helm repo add eks https://aws.github.io/eks-charts
-helm install aws-load-balancer-controller eks/aws-load-balancer-controller \\
-  -n kube-system \\
-  --set clusterName=streamcore-prod \\
-  --set serviceAccount.create=false \\
-  --set serviceAccount.name=aws-load-balancer-controller
-
-# Install cert-manager
-helm repo add jetstack https://charts.jetstack.io
-helm install cert-manager jetstack/cert-manager \\
-  --namespace cert-manager --create-namespace \\
-  --set installCRDs=true
-
-# ClusterIssuer for Let's Encrypt
-kubectl apply -f - << 'EOF'
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: letsencrypt-prod
-spec:
-  acme:
-    server: https://acme-v02.api.letsencrypt.org/directory
-    email: your@email.com
-    privateKeySecretRef:
-      name: letsencrypt-prod
-    solvers:
-    - http01:
-        ingress:
-          class: alb
-EOF`},
-     {title:"Gotchas & Tips",type:"tips",items:[
-       "EKS control plane costs ~$72/month regardless of nodes. Dev: use spot instances to keep total under $50/month.",
-       "IRSA > environment variables > instance profiles. Never put AWS keys in k8s secrets.",
-       "NAT gateway costs $0.045/GB transferred. Use VPC endpoints for S3/DynamoDB to eliminate NAT costs.",
-       "Spot instances get 2-minute interruption notice. Keep critical pods on on-demand, batch on spot.",
-     ]},
-   ]},
-  {id:"C2",week:"3–4",color:"#FF6B35",icon:"⬡",title:"Microservices — Design, Build & Deploy",
-   goal:"6 microservices deployed on EKS with resource limits, health checks, HPA, and Kong routing traffic.",
-   skills:["Microservice design: bounded contexts, API contracts","Dockerfile: multi-stage builds, non-root, minimal images","k8s: Deployments, Services, HPA, PDB, resource limits","ConfigMaps vs Secrets vs Vault","Kong API Gateway: routing, JWT, rate limiting per service"],
-   projects:[
-     {name:"6 Microservices on EKS",desc:"User, Content, Stream, Payment, Notification, Recommendation. Each with Dockerfile, Helm chart, HPA, PDB, health checks. Kong routing.",hard:true},
-     {name:"GitHub Actions CI",desc:"Per-service: lint → test → Trivy scan → build Docker → push ECR → update Helm tag → ArgoCD deploys.",hard:false},
-   ],
-   tools:["Docker","ECR","Helm","Kong","GitHub Actions","ArgoCD"],
-   content:[
-     {title:"Key Concepts",type:"concept",items:[
-       {term:"Bounded Context",def:"Each microservice owns its data and domain. Never share databases between services."},
-       {term:"Multi-stage Docker",def:"Build stage (fat image) → Runtime stage (minimal). Go binary in scratch = 8MB vs 800MB in golang:latest."},
-       {term:"HPA",def:"Horizontal Pod Autoscaler. Scales replicas on CPU/memory/custom metrics. Always set this."},
-       {term:"PDB",def:"Pod Disruption Budget. Guarantees minimum available pods during node drains. Set minAvailable:1 for all prod services."},
-     ]},
-     {title:"Dockerfile + CI Pipeline",type:"code",lang:"bash",content:`# User Service (Node.js) — multi-stage
-cat > services/user-service/Dockerfile << 'EOF'
-FROM node:20-alpine AS builder
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
-
-FROM node:20-alpine AS runtime
-RUN addgroup -g 1001 app && adduser -u 1001 -G app -D appuser
-WORKDIR /app
-COPY --from=builder --chown=appuser:app /app/node_modules ./node_modules
-COPY --chown=appuser:app . .
-USER appuser
-EXPOSE 3000
-HEALTHCHECK --interval=30s CMD wget -qO- http://localhost:3000/health || exit 1
-CMD ["node", "src/index.js"]
-EOF
-
-# Content Service (Go) — minimal scratch image
-cat > services/content-service/Dockerfile << 'EOF'
-FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o content-service ./cmd/server
-
-FROM scratch
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=builder /app/content-service /content-service
-EXPOSE 8080
-ENTRYPOINT ["/content-service"]
-EOF
-
-# Build and push all services to ECR
-AWS_ID=$(aws sts get-caller-identity --query Account --output text)
-ECR="$AWS_ID.dkr.ecr.us-east-1.amazonaws.com"
-aws ecr get-login-password | docker login --username AWS --password-stdin \${ECR}
-
-for svc in user-service content-service stream-service payment-service; do
-  aws ecr create-repository --repository-name "streamcore/\${svc}"
-  docker build -t \${ECR}/streamcore/\${svc}:latest services/\${svc}/
-  docker push \${ECR}/streamcore/\${svc}:latest
-done`},
-     {title:"Kubernetes Deployment with HPA + PDB",type:"code",lang:"yaml",content:`apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: user-service
-  namespace: user-service
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: user-service
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 0    # zero downtime
-      maxSurge: 1
-  template:
-    metadata:
-      labels:
-        app: user-service
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "3000"
-    spec:
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 1001
-      containers:
-      - name: user-service
-        image: ECR_REGISTRY/streamcore/user-service:TAG
-        resources:
-          requests: {cpu: "100m", memory: "128Mi"}
-          limits:   {cpu: "500m", memory: "512Mi"}
-        readinessProbe:
-          httpGet: {path: /health/ready, port: 3000}
-          initialDelaySeconds: 10
-          periodSeconds: 5
-        livenessProbe:
-          httpGet: {path: /health/live, port: 3000}
-          initialDelaySeconds: 30
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: user-service
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: user-service
-  minReplicas: 2
-  maxReplicas: 20
-  metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target: {type: Utilization, averageUtilization: 70}
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: user-service-pdb
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app: user-service`},
-     {title:"Gotchas & Tips",type:"tips",items:[
-       "Use OIDC for GitHub Actions → AWS auth. Never store AWS access keys in GitHub secrets.",
-       "Set CPU requests to ~25% of expected normal load. Set limits to 2x requests.",
-       "readinessProbe failing = pod removed from Service (no traffic). livenessProbe failing = pod restarted.",
-       "Helm values-prod.yaml in git = your CD config. ArgoCD watches this. Never kubectl apply manually in prod.",
-     ]},
-   ]},
-  {id:"C3",week:"5–6",color:"#A855F7",icon:"◉",title:"Data Layer — PostgreSQL, Redis, Kafka",
-   goal:"Full data layer: relational DB, distributed cache, event streaming — all production-hardened.",
-   skills:["RDS PostgreSQL: multi-AZ, read replicas, PgBouncer pooling","ElastiCache Redis: cluster mode, eviction, distributed locking","Amazon MSK Kafka: topics, consumer groups, Schema Registry","Database migrations: Flyway without downtime","Event-driven patterns between services"],
-   projects:[
-     {name:"Multi-DB Data Layer",desc:"RDS PostgreSQL + ElastiCache Redis cluster. Terraform. PgBouncer connection pooling. Automated backups.",hard:true},
-     {name:"Event-Driven Services",desc:"MSK Kafka. User events → Kafka → Notification service consumers. Schema Registry enforcing Avro schemas.",hard:true},
-   ],
-   tools:["AWS RDS","ElastiCache","MSK","PgBouncer","Kafka"],
-   content:[
-     {title:"Key Concepts",type:"concept",items:[
-       {term:"Multi-AZ RDS",def:"Synchronous replication to standby in another AZ. Auto-failover in 60-120s. Non-negotiable for prod."},
-       {term:"PgBouncer",def:"Connection pooler for PostgreSQL. Reduces actual DB connections from thousands to tens."},
-       {term:"Redis Eviction",def:"allkeys-lru = evict least recently used when memory full. For caching use this. For sessions use noeviction."},
-       {term:"Exactly-Once Kafka",def:"Idempotent producers + transactional API. No duplicates even on failure. Use for payment events."},
-     ]},
-     {title:"Terraform: RDS + ElastiCache",type:"code",lang:"bash",content:`# RDS PostgreSQL (modules/rds/main.tf)
-resource "aws_db_instance" "main" {
-  identifier        = "streamcore-prod-postgres"
-  engine            = "postgres"
-  engine_version    = "16.1"
-  instance_class    = "db.r6g.large"
-  allocated_storage = 100
-  storage_encrypted = true
-
-  multi_az               = true    # HA - required for prod
-  backup_retention_period = 7
-  deletion_protection    = true
-  performance_insights_enabled = true
-}
-
-# ElastiCache Redis (modules/redis/main.tf)
-resource "aws_elasticache_replication_group" "main" {
-  replication_group_id = "streamcore-prod-redis"
-  node_type            = "cache.r7g.large"
-  num_cache_clusters   = 3
-  automatic_failover_enabled = true
-  multi_az_enabled           = true
-  at_rest_encryption_enabled = true
-  transit_encryption_enabled = true
-}
-
-# MSK Kafka (modules/kafka/main.tf)
-resource "aws_msk_cluster" "main" {
-  cluster_name           = "streamcore-prod"
-  kafka_version          = "3.5.1"
-  number_of_broker_nodes = 3
-  broker_node_group_info {
-    instance_type = "kafka.m5.large"
-    storage_info {
-      ebs_storage_info {
-        volume_size = 1000
-      }
-    }
-  }
-  encryption_info {
-    encryption_in_transit {
-      client_broker = "TLS"
-    }
-  }
-}`},
-     {title:"Redis Cache-Aside Pattern",type:"code",lang:"python",content:`import redis, json, time
-
-r = redis.Redis(
-    host='streamcore-redis.xxx.cache.amazonaws.com',
-    port=6379, ssl=True,
-    password='YOUR_AUTH_TOKEN'
-)
-
-# Cache-aside pattern
-def get_with_cache(key, ttl_seconds, fetch_fn):
-    cached = r.get(key)
-    if cached:
-        return json.loads(cached)
-    # Cache miss
-    data = fetch_fn()
-    r.setex(key, ttl_seconds, json.dumps(data))
-    return data
-
-# Usage
-user = get_with_cache(
-    f'user:{user_id}',
-    300,  # 5 minutes
-    lambda: db.users.find_by_id(user_id)
-)
-
-# PgBouncer connection pooling deployment
-# All services connect to pgbouncer:5432, not RDS directly
-# PgBouncer opens max 20 real connections to RDS
-# 100 pods think they each have a connection — pool manages it
-# Config: pool_mode = transaction (best for microservices)`},
-     {title:"Gotchas & Tips",type:"tips",items:[
-       "RDS Multi-AZ failover = 60-120 seconds. Your app MUST handle transient DB connection failures with retry.",
-       "Redis cluster mode: use hash tags {user}:profile so multi-key commands land on same slot.",
-       "PgBouncer transaction mode: prepared statements DON'T work. Disable in your ORM.",
-       "Never store session data in PostgreSQL. Use Redis. DB is the bottleneck.",
-     ]},
-   ]},
-  {id:"C4",week:"7–8",color:"#00FFB2",icon:"◈",title:"Service Mesh — Istio, mTLS & Canary Deploys",
-   goal:"Istio installed, all services on mTLS, Flagger canary deployments, circuit breakers active.",
-   skills:["Istio: control plane (istiod), data plane (Envoy)","mTLS: auto cert rotation, PeerAuthentication","Traffic management: VirtualServices, DestinationRules","Circuit breaking + retry policies","Flagger: automated canary analysis"],
-   projects:[
-     {name:"Full Istio Service Mesh",desc:"Istio on EKS, all namespaces injected, STRICT mTLS cluster-wide, Kiali dashboard.",hard:true},
-     {name:"Flagger Canary Pipeline",desc:"Content service canary: 10% → auto-promote if error rate <1%, auto-rollback if >5%. Driven by Flagger.",hard:true},
-   ],
-   tools:["Istio","Envoy","Kiali","Flagger"],
-   content:[
-     {title:"Flagger Automated Canary",type:"code",lang:"yaml",content:`apiVersion: flagger.app/v1beta1
-kind: Canary
-metadata:
-  name: content-service
-  namespace: content-service
-spec:
-  targetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: content-service
-  service:
-    port: 80
-    hosts: [content.streamcore.com]
-    gateways: [istio-system/main-gateway]
-  analysis:
-    interval: 1m
-    threshold: 5          # fail after 5 bad checks
-    maxWeight: 50         # max 50% canary traffic
-    stepWeight: 10        # +10% per interval
-    metrics:
-    - name: request-success-rate
-      thresholdRange:
-        min: 99           # rollback if <99% success
-      interval: 1m
-    - name: request-duration
-      thresholdRange:
-        max: 500          # rollback if p99 >500ms
-      interval: 1m
----
-apiVersion: networking.istio.io/v1alpha3
-kind: DestinationRule
-metadata:
-  name: content-service
-spec:
-  host: content-service
-  trafficPolicy:
-    outlierDetection:
-      consecutive5xxErrors: 5
-      interval: 30s
-      baseEjectionTime: 30s
-      maxEjectionPercent: 50
-    connectionPool:
-      tcp: {maxConnections: 100}
-      http: {http2MaxRequests: 1000}`},
-     {title:"Gotchas & Tips",type:"tips",items:[
-       "STRICT mTLS breaks services calling external HTTP endpoints. Use ServiceEntry to declare external services.",
-       "Flagger needs Prometheus for canary analysis. Install Prometheus first or Flagger can't auto-promote.",
-       "Envoy sidecars add ~2-5ms latency per hop. Acceptable for most use cases.",
-     ]},
-   ]},
-  {id:"C5",week:"9–10",color:"#FF6B35",icon:"⬡",title:"Full Observability — Metrics, Traces, Logs, SLOs",
-   goal:"Every request traced end-to-end, every service has SLOs, dashboards for latency/errors/saturation.",
-   skills:["Prometheus + Grafana: RED method dashboards, recording rules","Distributed tracing: Jaeger with OpenTelemetry in all services","Centralized logging: Loki + Promtail, structured JSON, correlation IDs","SLOs and error budgets: burn rate alerts","PagerDuty integration + runbooks"],
-   projects:[
-     {name:"Full O11y Stack",desc:"Prometheus + Grafana + Loki + Jaeger on k8s. RED dashboards for all 6 services, DB pool utilization.",hard:true},
-     {name:"SLO Dashboard + Alerts",desc:"SLOs per service (99.9% availability, p99 <500ms). Error budget burn rate alerts. PagerDuty routing.",hard:false},
-   ],
-   tools:["Prometheus","Grafana","Loki","Jaeger","OpenTelemetry","PagerDuty"],
-   content:[
-     {title:"Key Concepts",type:"concept",items:[
-       {term:"RED Method",def:"Rate (req/sec), Errors (error rate %), Duration (latency). The three metrics every service must expose."},
-       {term:"SLO",def:"Service Level Objective. Internal target: 99.9% of requests < 500ms over 30 days."},
-       {term:"Error Budget",def:"How much downtime you can afford. 99.9% = 43min/month. Burn rate alert fires when budget exhausts in <1hr."},
-       {term:"Correlation ID",def:"UUID added at API gateway, passed through all services. Ties all logs for one user request together."},
-     ]},
-     {title:"Deploy kube-prometheus-stack + Loki",type:"code",lang:"bash",content:`# kube-prometheus-stack (Prometheus + Grafana + Alertmanager)
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \\
-  --namespace monitoring --create-namespace \\
-  --set grafana.adminPassword=changeme-in-prod \\
-  --set prometheus.prometheusSpec.retention=30d \\
-  --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=100Gi
-
-# Loki (log aggregation)
-helm install loki grafana/loki-stack \\
-  --namespace monitoring \\
-  --set promtail.enabled=true \\
-  --set loki.persistence.enabled=true \\
-  --set loki.persistence.size=50Gi
-
-# Jaeger (distributed tracing)
-helm repo add jaegertracing https://jaegertracing.github.io/helm-charts
-helm install jaeger jaegertracing/jaeger \\
-  --namespace monitoring \\
-  --set allInOne.enabled=true \\
-  --set storage.type=elasticsearch   # use ES in prod
-
-# SLO burn rate alert
-kubectl apply -f - << 'EOF'
-apiVersion: monitoring.coreos.com/v1
-kind: PrometheusRule
-metadata:
-  name: streamcore-slos
-  namespace: monitoring
-spec:
-  groups:
-  - name: slos
-    rules:
-    - alert: SLOBurnRateHigh
-      expr: |
-        sum(rate(http_requests_total{status!~"5.."}[5m])) /
-        sum(rate(http_requests_total[5m])) < 0.986
-      for: 2m
-      labels:
-        severity: critical
-      annotations:
-        summary: "SLO burn rate too high — exhausting error budget"
-EOF`},
-     {title:"Gotchas & Tips",type:"tips",items:[
-       "Cardinality kills Prometheus. Never use user_id as a label. Unbounded labels OOM your Prometheus.",
-       "Structured JSON logs are mandatory. log.info('msg', {userId, correlationId, duration}) not log.info('user 123 took 23ms').",
-       "Jaeger: 100% sampling in dev, 1-10% in prod. Always sample 100% of errors regardless of rate.",
-       "Set up PagerDuty BEFORE going to prod. You can't set up alerting fast enough during an actual incident.",
-     ]},
-   ]},
-  {id:"C6",week:"11–12",color:"#A855F7",icon:"◉",title:"Security — Vault, OPA, Trivy, Falco",
-   goal:"Zero-trust posture: no hardcoded secrets, image scanning, runtime threat detection, admission control.",
-   skills:["HashiCorp Vault: dynamic secrets, PKI, Agent injection","OPA Gatekeeper: admission control policies","Trivy image scanning in CI","Falco: runtime container security","AWS GuardDuty + Security Hub"],
-   projects:[
-     {name:"Vault + Dynamic Secrets",desc:"Vault on k8s. DB credentials created per-pod, auto-rotated. Vault Agent injects. Zero static credentials.",hard:true},
-     {name:"Security Hardening Suite",desc:"OPA Gatekeeper policies + Trivy in CI + Falco runtime detection. Security score dashboard.",hard:false},
-   ],
-   tools:["HashiCorp Vault","OPA Gatekeeper","Trivy","Falco","GuardDuty"],
-   content:[
-     {title:"Key Concepts",type:"concept",items:[
-       {term:"Dynamic Secrets",def:"Vault creates DB credentials on-demand per pod. Auto-expire when pod dies. Even if leaked, useless in minutes."},
-       {term:"Vault Agent",def:"Sidecar injected by Vault Agent Injector. Authenticates via k8s SA, writes secrets to shared volume. App reads files."},
-       {term:"OPA Gatekeeper",def:"Validates/mutates k8s resources at creation. Enforce: no latest tags, required resource limits, no privileged containers."},
-       {term:"Falco",def:"Runtime security. Watches kernel syscalls. Alerts on: unexpected network connections, shell in container, /etc changes."},
-     ]},
-     {title:"Vault Setup + Dynamic DB Secrets",type:"code",lang:"bash",content:`# Install Vault on k8s (HA mode)
-helm repo add hashicorp https://helm.releases.hashicorp.com
-helm install vault hashicorp/vault \\
-  --namespace vault --create-namespace \\
-  --set server.ha.enabled=true \\
-  --set server.ha.replicas=3 \\
-  --set injector.enabled=true
-
-# Initialize Vault
-kubectl exec -n vault vault-0 -- vault operator init \\
-  -key-shares=5 -key-threshold=3 -format=json > vault-keys.json
-
-# Store keys in AWS Secrets Manager immediately!
-aws secretsmanager create-secret --name streamcore/vault/keys \\
-  --secret-string file://vault-keys.json
-
-# Configure k8s auth
-kubectl exec -n vault vault-0 -- vault auth enable kubernetes
-kubectl exec -n vault vault-0 -- vault write auth/kubernetes/config \\
-  kubernetes_host="https://KUBERNETES_API:443"
-
-# Enable PostgreSQL dynamic secrets
-kubectl exec -n vault vault-0 -- vault secrets enable database
-kubectl exec -n vault vault-0 -- vault write database/roles/user-service \\
-  db_name=streamcore-postgres \\
-  default_ttl="1h" max_ttl="24h"
-
-# Pod annotations to inject credentials
-# vault.hashicorp.com/agent-inject: "true"
-# vault.hashicorp.com/role: "user-service"
-# vault.hashicorp.com/agent-inject-secret-db: "database/creds/user-service"`},
-     {title:"OPA + Trivy Policies",type:"code",lang:"bash",content:`# Install OPA Gatekeeper
-helm install gatekeeper opa/gatekeeper \\
-  --namespace gatekeeper-system --create-namespace
-
-# Policy: no 'latest' tags
-kubectl apply -f - << 'EOF'
-apiVersion: constraints.gatekeeper.sh/v1beta1
-kind: K8sDisallowedTags
-metadata:
-  name: no-latest-tags
-spec:
-  match:
-    kinds: [{apiGroups: ["apps"], kinds: ["Deployment"]}]
-  parameters:
-    tags: ["latest"]
-EOF
-
-# Policy: require resource limits
-kubectl apply -f - << 'EOF'
-apiVersion: constraints.gatekeeper.sh/v1beta1
-kind: K8sRequiredResources
-metadata:
-  name: require-resource-limits
-spec:
-  match:
-    kinds: [{apiGroups: [""], kinds: ["Pod"]}]
-  parameters:
-    limits: [cpu, memory]
-    requests: [cpu, memory]
-EOF
-
-# Trivy in GitHub Actions CI
-# - name: Scan image
-#   uses: aquasecurity/trivy-action@master
-#   with:
-#     image-ref: ECR_REGISTRY/service:TAG
-#     exit-code: 1
-#     severity: CRITICAL,HIGH
-#     ignore-unfixed: true`},
-     {title:"Gotchas & Tips",type:"tips",items:[
-       "Auto-unseal Vault with AWS KMS in prod. Manual unseal = if all vault pods restart, you're locked out.",
-       "OPA Gatekeeper: run in 'dryrun' mode first to audit violations, then switch to 'deny'. Never go straight to deny.",
-       "Trivy ignore-unfixed is important. Only fail on CVEs with available patches.",
-       "Rotate ALL secrets on day 1 of a security incident. Vault dynamic secrets = only the current pod is compromised.",
-     ]},
-   ]},
-  {id:"C7",week:"13–14",color:"#FACC15",icon:"◆",title:"Performance, Scale & Chaos Engineering",
-   goal:"Load test to 10,000 concurrent users, find and fix all bottlenecks, chaos tests running in CI.",
-   skills:["k6 load testing: realistic user journeys, thresholds","Profiling: Node.js clinic.js, Go pprof","DB optimization: EXPLAIN ANALYZE, indexes","CloudFront for API response caching","Chaos engineering automated in CI"],
-   projects:[
-     {name:"10K User Load Test",desc:"k6 script: signup → login → browse → stream. Run against staging. Fix bottlenecks. p99 <500ms at 10K.",hard:true},
-     {name:"Chaos Test Suite in CI",desc:"Chaos Mesh: pod kill, network partition, DB failover. Run weekly. Assert SLO recovery in 60 seconds.",hard:false},
-   ],
-   tools:["k6","Chaos Mesh","CloudFront","Go pprof"],
-   content:[
-     {title:"k6 Load Test: User Journey",type:"code",lang:"bash",content:`# brew install k6 (Mac) or snap install k6 (Linux)
-
-cat > load-tests/journey.js << 'JSEOF'
-import http from 'k6/http';
-import { check, sleep } from 'k6';
-import { Rate } from 'k6/metrics';
-
-const errorRate = new Rate('errors');
-
-export const options = {
-  stages: [
-    { duration: '2m', target: 100   },
-    { duration: '5m', target: 1000  },
-    { duration: '5m', target: 5000  },
-    { duration: '5m', target: 10000 },
-    { duration: '3m', target: 0     },
-  ],
-  thresholds: {
-    http_req_duration: ['p(99)<500'],  // p99 < 500ms
-    http_req_failed: ['rate<0.01'],    // < 1% errors
-  },
+const PHASE_ORDER = ["FOUNDATION","GITOPS","FINOPS","SERVICE MESH","DATA LAYER","SERVICES","LOGGING","OBSERVABILITY","HARDENING"];
+const PHASE_COLORS = {
+  FOUNDATION:"#00FFB2",GITOPS:"#A855F7",FINOPS:"#FACC15",
+  "SERVICE MESH":"#FF6B35","DATA LAYER":"#38BDF8",SERVICES:"#00FFB2",
+  LOGGING:"#A855F7",OBSERVABILITY:"#FF6B35",HARDENING:"#FACC15"
 };
 
-const BASE = 'https://api.streamcore.com';
-
-export default function () {
-  // Login
-  const loginRes = http.post(BASE + '/users/login',
-    JSON.stringify({email: 'test@test.com', password: 'Test1234!'}),
-    {headers: {'Content-Type': 'application/json'}});
-  const token = loginRes.json('token');
-  check(loginRes, { 'login 200': r => r.status === 200 });
-
-  const headers = { Authorization: 'Bearer ' + token };
-  sleep(1);
-
-  // Browse content
-  const contentRes = http.get(BASE + '/content?page=1', {headers});
-  check(contentRes, { 'content 200': r => r.status === 200 });
-  sleep(2);
-
-  // Stream
-  const contentId = contentRes.json('items[0].id');
-  const streamRes = http.get(BASE + '/stream/' + contentId, {headers});
-  errorRate.add(streamRes.status !== 200);
-  sleep(30);
-}
-JSEOF
-
-# Run with Prometheus output
-k6 run --out prometheus=http://prometheus:9090/api/v1/write \\
-  load-tests/journey.js`},
-     {title:"Gotchas & Tips",type:"tips",items:[
-       "Load test against staging with prod-scale data. 10 rows in staging DB = false confidence.",
-       "Your first load test WILL reveal connection pool exhaustion. It's always the DB or Redis pool.",
-       "k6 VUs are goroutines, not browsers. 10K VUs hit API continuously. Scale VUs to match your actual RPS target.",
-       "CloudFront in front of API Gateway: even 60-second cache TTL for content listings eliminates 90% of DB reads.",
-     ]},
-   ]},
-  {id:"C8",week:"15–16",color:"#00FFB2",icon:"◈",title:"CTO Capstone — Production Hardening & Docs",
-   goal:"StreamCore live on AWS. Load tested. Security hardened. Costs optimized. Architecture documented. CTO portfolio ready.",
-   skills:["FinOps: cost tagging, Reserved Instances, Spot savings","DR: RTO/RPO targets, cross-region failover, backup testing","Developer platform: Backstage IDP for StreamCore","C4 architecture diagrams + ADR library","On-call: incident response, blameless postmortems"],
-   projects:[
-     {name:"🏆 StreamCore — Live on AWS",desc:"All 8 phases deployed. 10K load tested. Security hardened. Costs under $500/month dev, $650/month prod. GitHub portfolio with full docs.",hard:true},
-     {name:"CTO Architecture Deck",desc:"5-slide deck: C4 diagrams, FinOps report, SLO dashboard, security posture. The deck you'd present to a board.",hard:false},
-   ],
-   tools:["Backstage","C4 Model","AWS Cost Explorer","Terraform"],
-   content:[
-     {title:"CTO Architecture Checklist",type:"tips",items:[
-       "✅ Multi-AZ everything: EKS nodes, RDS, ElastiCache, MSK. Single-AZ is an anti-pattern.",
-       "✅ Zero hardcoded secrets: Vault dynamic secrets for DB, Secrets Manager for API keys, IRSA for AWS.",
-       "✅ GitOps: ArgoCD is the only thing that touches production clusters. No manual kubectl apply.",
-       "✅ Every service has: SLO defined, SLO dashboard, burn rate alert, on-call runbook, PDB.",
-       "✅ Security: OPA blocks non-compliant deploys, Trivy blocks vulnerable images, Falco monitors runtime.",
-       "✅ FinOps: all resources tagged by team/service, monthly cost report, RIs for 6mo+ baseline.",
-       "✅ Documented: C4 diagrams, ADRs for every major decision, runbooks for every alert.",
-       "✅ Load tested: every service benchmarked at 10x expected traffic. Scaling plan written.",
-     ]},
-     {title:"Monthly Cost Breakdown",type:"code",lang:"bash",content:`# StreamCore Prod Estimated Costs
-echo "
-EKS Control Plane:              \$72/month (fixed)
-EC2 nodes (3x m5.xlarge spot):  ~\$80/month
-RDS Multi-AZ db.r6g.large:      ~\$180/month
-ElastiCache cache.r7g.large:    ~\$120/month
-MSK (3x kafka.m5.large):        ~\$200/month
-ALB:                            ~\$20/month
-NAT Gateway (3 AZs):            ~\$35/month
-S3 + CloudFront:                ~\$50/month
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Total on-demand:                ~\$757/month
-With Reserved Instances (1yr):  ~\$450/month
-With Spot for EC2:              ~\$400/month
-"
-
-# Tag everything for cost attribution
-# In Terraform provider:
-# default_tags {
-#   tags = {
-#     Project = "streamcore"
-#     Environment = var.env
-#     Team = var.team
-#     Service = var.service
-#     ManagedBy = "terraform"
-#   }
-# }
-
-# Analyze and buy Reserved Instances
-aws ce get-reservation-purchase-recommendation \\
-  --service "Amazon EC2" \\
-  --payment-option ALL_UPFRONT \\
-  --lookback-period-in-days THIRTY_DAYS`},
-     {title:"DR Runbook",type:"code",lang:"bash",content:`#!/bin/bash
-# test-dr.sh — run weekly in CI
-
-echo "=== StreamCore DR Test ==="
-
-# Verify RDS backups exist and are recent
-LATEST=$(aws rds describe-db-snapshots \\
-  --db-instance-identifier streamcore-prod-postgres \\
-  --query 'reverse(sort_by(DBSnapshots,&SnapshotCreateTime))[0].DBSnapshotIdentifier' \\
-  --output text)
-echo "Latest snapshot: \${LATEST}"
-
-# Test restore to temp instance
-aws rds restore-db-instance-from-db-snapshot \\
-  --db-instance-identifier streamcore-dr-test \\
-  --db-snapshot-identifier \${LATEST} \\
-  --db-instance-class db.t3.micro
-
-aws rds wait db-instance-available \\
-  --db-instance-identifier streamcore-dr-test
-echo "PASS: DB restore succeeded"
-
-# Cleanup
-aws rds delete-db-instance \\
-  --db-instance-identifier streamcore-dr-test \\
-  --skip-final-snapshot
-
-echo "=== DR Test Complete ==="
-# RTO target: 2 hours | RPO target: 15 minutes`},
-   ]},
-];
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SHARED TRACKER LOGIC
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function freshAITracker(){
-  const ws={},pr={};
-  AI_WEEKS.forEach(w=>{ws[w.week]="not_started";w.projects.forEach((_,i)=>{pr[`${w.week}-${i}`]=false;});});
-  return{weekStatus:ws,projects:pr,startDate:new Date().toISOString()};
-}
-function freshCTOTracker(){
-  const ps={},pr={};
-  CTO_PHASES.forEach(p=>{ps[p.id]="not_started";p.projects.forEach((_,i)=>{pr[`${p.id}-${i}`]=false;});});
-  return{phaseStatus:ps,projects:pr,startDate:new Date().toISOString()};
+function freshCTOProjectTracker(){
+  const steps={};
+  CTO_STEPS.forEach(s=>{steps[s.id]=false;});
+  return{steps,startDate:new Date().toISOString()};
 }
 
-const PCOL={P1:"#00FFB2",P2:"#FF6B35",P3:"#A855F7",P4:"#FACC15"};
-const UCOL={NOW:"#00FFB2",SOON:"#FF6B35","NEXT YEAR":"#A855F7"};
-const AI_TOTAL_HOURS=AI_WEEKS.reduce((s,w)=>s+w.hours,0);
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// AI PLAN COMPONENT
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function AIPlan(){
-  const [openWeek,setOpenWeek]=useState(null);
-  const [innerTab,setInnerTab]=useState({});
-  const [mainTab,setMainTab]=useState("roadmap");
-  const [resFilter,setResFilter]=useState("all");
+function CTOProject(){
+  const [openStep,setOpenStep]=useState(null);
   const [tracker,setTracker]=useState(null);
   const [loaded,setLoaded]=useState(false);
+  const [activePhase,setActivePhase]=useState("ALL");
 
-  useEffect(()=>{loadData("ai_plan_v3").then(d=>{setTracker(d||freshAITracker());setLoaded(true);});}, []);
-  const save=(n)=>{setTracker(n);saveData("ai_plan_v3",n);};
-  const cycleStatus=(wn)=>{
-    const cur=tracker?.weekStatus[wn]||"not_started";
-    const nxt=cur==="not_started"?"in_progress":cur==="in_progress"?"done":"not_started";
-    save({...tracker,weekStatus:{...tracker.weekStatus,[wn]:nxt}});
-  };
-  const toggleProj=(k)=>save({...tracker,projects:{...tracker.projects,[k]:!tracker.projects?.[k]}});
-  const resetT=()=>save(freshAITracker());
+  useEffect(()=>{loadData("cto_project_v1").then(d=>{setTracker(d||freshCTOProjectTracker());setLoaded(true);});}, []);
+  const save=(n)=>{setTracker(n);saveData("cto_project_v1",n);};
+  const toggleStep=(id)=>save({...tracker,steps:{...tracker.steps,[id]:!tracker.steps?.[id]}});
+  const resetT=()=>save(freshCTOProjectTracker());
 
-  const doneW=tracker?Object.values(tracker.weekStatus).filter(s=>s==="done").length:0;
-  const inProgW=tracker?Object.values(tracker.weekStatus).filter(s=>s==="in_progress").length:0;
-  const doneP=tracker?Object.values(tracker.projects).filter(Boolean).length:0;
-  const doneH=tracker?AI_WEEKS.filter(w=>tracker.weekStatus[w.week]==="done").reduce((s,w)=>s+w.hours,0):0;
-  const allProjects=AI_WEEKS.flatMap(w=>w.projects.map((p,i)=>({weekNum:w.week,projIdx:i,name:p.name,hard:p.hard,phase:w.phase,phaseColor:w.phaseColor})));
-  const pct=Math.round((doneW/AI_WEEKS.length)*100);
-  const getIT=(wn)=>innerTab[wn]||"overview";
-  const setIT=(wn,t)=>setInnerTab(p=>({...p,[wn]:t}));
-
-  if(!loaded) return <div style={{color:"#00FFB2",padding:40,textAlign:"center",fontFamily:"monospace",fontSize:11,letterSpacing:3}}>LOADING...</div>;
-
-  return(
-    <div>
-      {/* Pillars */}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(185px,1fr))",gap:9,marginBottom:26}}>
-        {[["12 WEEKS","3-Month Plan"],[`${AI_TOTAL_HOURS} HRS`,"~31h/week"],["4 PILLARS","Core Domains"],[`${pct}%`,"Completed"]].map(([v,l])=>(
-          <div key={v} style={{background:"#0D1117",border:"1px solid #00FFB230",borderTop:"3px solid #00FFB2",padding:"12px 14px",borderRadius:4}}>
-            <div style={{fontFamily:"'Syne',sans-serif",fontSize:22,fontWeight:800,color:"#00FFB2"}}>{v}</div>
-            <div style={{fontSize:9,color:"#4A5568",letterSpacing:2,textTransform:"uppercase"}}>{l}</div>
-          </div>
-        ))}
-      </div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(185px,1fr))",gap:9,marginBottom:26}}>
-        {[{id:"P1",label:"AI-Native Platform Eng.",color:"#00FFB2",icon:"◈"},{id:"P2",label:"MLOps & Model Lifecycle",color:"#FF6B35",icon:"⬡"},{id:"P3",label:"AI Agents for Infra",color:"#A855F7",icon:"◉"},{id:"P4",label:"GPU & AI Infra at Scale",color:"#FACC15",icon:"◆"}].map(p=>(
-          <div key={p.id} style={{background:"#0D1117",border:`1px solid ${p.color}25`,borderTop:`3px solid ${p.color}`,padding:"12px 14px",borderRadius:4}}>
-            <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:6}}><span style={{color:p.color,fontSize:14}}>{p.icon}</span><span style={{color:p.color,fontSize:9,letterSpacing:2}}>{p.id}</span></div>
-            <div style={{fontSize:11,fontWeight:500,color:"#E8EAF0"}}>{p.label}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Sub-tabs */}
-      <div style={{display:"flex",borderBottom:"1px solid #1A2030",marginBottom:20}}>
-        {[["roadmap","Roadmap"],["tracker","Tracker"]].map(([t,l])=>(
-          <button key={t} className="tb" onClick={()=>setMainTab(t)} style={{color:mainTab===t?"#00FFB2":"#4A5568",padding:"10px 16px",fontSize:10,letterSpacing:3,textTransform:"uppercase",borderBottom:mainTab===t?"2px solid #00FFB2":"2px solid transparent",marginBottom:-1}}>
-            {l}{t==="tracker"&&doneW>0&&<span style={{marginLeft:5,background:"#00FFB220",color:"#00FFB2",fontSize:8,padding:"1px 4px",borderRadius:2}}>{doneW}/{AI_WEEKS.length}</span>}
-          </button>
-        ))}
-      </div>
-
-      {mainTab==="roadmap"&&(
-        <div style={{display:"flex",flexDirection:"column",gap:5}}>
-          {AI_WEEKS.map(w=>{
-            const isOn=openWeek===w.week;
-            const st=tracker?.weekStatus[w.week]||"not_started";
-            const sm=SMETA[st];
-            const wProjs=w.projects.map((_,i)=>({k:`${w.week}-${i}`,done:tracker?.projects[`${w.week}-${i}`]||false}));
-            const pDone=wProjs.filter(p=>p.done).length;
-            const it=getIT(w.week);
-            const res=resFilter==="all"?w.resources:w.resources.filter(r=>r.type===resFilter);
-            return(
-              <div key={w.week}>
-                <div className={`wk${isOn?" on":""}`} onClick={()=>setOpenWeek(isOn?null:w.week)}
-                  style={{background:"#0D1117",borderRadius:isOn?"4px 4px 0 0":4,padding:"14px 18px",borderLeft:`3px solid ${w.phaseColor}`}}>
-                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:7}}>
-                    <div style={{display:"flex",alignItems:"center",gap:11}}>
-                      <span style={{fontFamily:"'Syne',sans-serif",fontSize:12,fontWeight:800,color:w.phaseColor,minWidth:20}}>W{w.week}</span>
-                      <div>
-                        <div style={{fontSize:12,color:"#E8EAF0"}}>{w.title}</div>
-                        <div style={{fontSize:9,color:"#4A5568",marginTop:1}}>{w.phase} · {w.hours}h · {(w.resources||[]).length} refs</div>
-                      </div>
-                    </div>
-                    <div style={{display:"flex",alignItems:"center",gap:6}}>
-                      <span style={{fontSize:9,color:sm.tc}}>{sm.dot}</span>
-                      <span style={{background:`${PCOL[w.pillar]}12`,color:PCOL[w.pillar],fontSize:8,letterSpacing:2,padding:"2px 7px",borderRadius:2}}>{w.pillar}</span>
-                      {pDone>0&&<span style={{fontSize:9,color:"#00FFB2"}}>{pDone}/{w.projects.length}✓</span>}
-                      <span style={{color:"#4A5568",fontSize:10}}>{isOn?"▲":"▼"}</span>
-                    </div>
-                  </div>
-                </div>
-                {isOn&&(
-                  <div style={{background:"#0A0E14",border:"1px solid #1A2030",borderTop:"none",borderRadius:"0 0 4px 4px"}}>
-                    <div style={{display:"flex",borderBottom:"1px solid #1A2030",padding:"0 16px"}}>
-                      {[["overview","Overview"],["content","📖 Learn"],["resources","References"]].map(([t,l])=>(
-                        <button key={t} className="itb" onClick={e=>{e.stopPropagation();setIT(w.week,t);}}
-                          style={{color:it===t?"#00FFB2":"#4A5568",padding:"9px 13px",fontSize:9,letterSpacing:2,textTransform:"uppercase",borderBottom:it===t?"2px solid #00FFB2":"2px solid transparent",marginBottom:-1,background:"none",border:"none"}}>
-                          {l}
-                        </button>
-                      ))}
-                    </div>
-                    <div style={{padding:"16px"}}>
-                      {it==="overview"&&(
-                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
-                          <div>
-                            <div style={{fontSize:9,color:"#00FFB2",letterSpacing:3,marginBottom:8}}>WHAT YOU LEARN</div>
-                            {w.skills.map((s,i)=>(
-                              <div key={i} style={{display:"flex",gap:7,marginBottom:5,fontSize:11,color:"#A0A8B8",lineHeight:1.45}}>
-                                <span style={{color:"#00FFB2",flexShrink:0}}>→</span><span>{s}</span>
-                              </div>
-                            ))}
-                            <div style={{marginTop:12}}>
-                              <div style={{fontSize:9,color:"#4A5568",letterSpacing:3,marginBottom:5}}>TOOLS</div>
-                              <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
-                                {w.tools.map(t=><span key={t} style={{background:"#1A2030",color:"#A0A8B8",fontSize:9,padding:"2px 7px",borderRadius:2}}>{t}</span>)}
-                              </div>
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{fontSize:9,color:"#FF6B35",letterSpacing:3,marginBottom:8}}>BUILD THESE PROJECTS</div>
-                            {w.projects.map((p,i)=>{
-                              const pk=`${w.week}-${i}`;
-                              const done=tracker?.projects[pk]||false;
-                              return(
-                                <div key={i} style={{background:"#0D1117",border:"1px solid #1A2030",borderLeft:`3px solid ${p.hard?"#FF6B35":"#A855F7"}`,padding:"10px 12px",marginBottom:7,borderRadius:"0 4px 4px 0"}}>
-                                  <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:4}}>
-                                    <span onClick={e=>{e.stopPropagation();toggleProj(pk);}} className="chk" style={{fontSize:13,color:done?"#00FFB2":"#2A3040"}}>{done?"☑":"☐"}</span>
-                                    <span style={{fontSize:11,color:done?"#4A5568":"#E8EAF0",textDecoration:done?"line-through":"none"}}>{p.name}</span>
-                                    {p.hard&&<span style={{background:"#FF6B3520",color:"#FF6B35",fontSize:7,padding:"1px 5px",borderRadius:2}}>HARD</span>}
-                                  </div>
-                                  <div style={{fontSize:10,color:"#4A5568",lineHeight:1.5}}>{p.desc}</div>
-                                </div>
-                              );
-                            })}
-                            <button className="sc" onClick={e=>{e.stopPropagation();cycleStatus(w.week);}}
-                              style={{background:sm.color,color:sm.tc,fontSize:8,padding:"4px 10px",letterSpacing:2,textTransform:"uppercase",border:`1px solid ${sm.tc}30`,marginTop:8}}>
-                              {sm.dot} {sm.label}
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                      {it==="content"&&<ContentRenderer sections={w.content||[]}/>}
-                      {it==="resources"&&(
-                        <div>
-                          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12,flexWrap:"wrap",gap:6}}>
-                            <div style={{fontSize:9,color:"#FACC15",letterSpacing:3}}>◆ EXTERNAL REFERENCES ({(w.resources||[]).length})</div>
-                            <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
-                              {["all","docs","course","video","book","repo"].map(f=>(
-                                <button key={f} className="fb" onClick={e=>{e.stopPropagation();setResFilter(f===resFilter?"all":f);}}
-                                  style={{background:resFilter===f?"#FACC1518":"#0D1117",color:resFilter===f?"#FACC15":"#4A5568",border:`1px solid ${resFilter===f?"#FACC1540":"#1A2030"}`,fontSize:8,padding:"3px 7px",letterSpacing:1,textTransform:"uppercase"}}>
-                                  {f==="all"?"ALL":RMETA[f]?.label}
-                                </button>
-                              ))}
-                            </div>
-                          </div>
-                          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:6}}>
-                            {res.map((r,i)=>{
-                              const m=RMETA[r.type];
-                              return(
-                                <a key={i} href={r.url} target="_blank" rel="noopener noreferrer" className="rl"
-                                  style={{background:"#0D1117",border:`1px solid ${m.color}20`,borderLeft:`2px solid ${m.color}`,padding:"9px 12px",borderRadius:"0 4px 4px 0"}}>
-                                  <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:3}}><span style={{color:m.color,fontSize:8}}>{m.icon}</span><span style={{fontSize:8,color:m.color,letterSpacing:2}}>{m.label}</span></div>
-                                  <div style={{fontSize:11,color:"#E8EAF0",marginBottom:2}}>{r.label}</div>
-                                  <div style={{fontSize:9,color:"#4A5568",lineHeight:1.4}}>{r.note}</div>
-                                </a>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {mainTab==="tracker"&&(
-        <div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8,marginBottom:20}}>
-            {[{l:"WEEKS DONE",v:doneW,t:AI_WEEKS.length,c:"#00FFB2"},{l:"IN PROGRESS",v:inProgW,t:AI_WEEKS.length,c:"#FF6B35"},{l:"PROJECTS",v:doneP,t:allProjects.length,c:"#A855F7"},{l:"HOURS BANKED",v:doneH,t:AI_TOTAL_HOURS,c:"#FACC15"}].map(s=>(
-              <div key={s.l} style={{background:"#0D1117",border:`1px solid ${s.c}25`,borderTop:`3px solid ${s.c}`,padding:"12px 14px",borderRadius:4}}>
-                <div style={{fontSize:8,color:"#4A5568",letterSpacing:3,marginBottom:5}}>{s.l}</div>
-                <div style={{fontFamily:"'Syne',sans-serif",fontSize:22,fontWeight:800,color:s.c}}>{s.v}<span style={{fontSize:10,color:"#4A5568",fontFamily:"inherit",fontWeight:400}}> / {s.t}</span></div>
-                <div style={{background:"#1A2030",height:3,borderRadius:2,marginTop:6}}><div className="bar" style={{background:s.c,height:"100%",width:`${Math.round((s.v/s.t)*100)}%`,borderRadius:2}}/></div>
-              </div>
-            ))}
-          </div>
-          <div style={{background:"#0D1117",border:"1px solid #00FFB230",borderRadius:4,padding:"12px 16px",marginBottom:16}}>
-            <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:9,color:"#00FFB2",letterSpacing:3}}>COMPLETION</span><span style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800,color:"#00FFB2"}}>{pct}%</span></div>
-            <div style={{background:"#1A2030",height:6,borderRadius:3}}><div className="bar" style={{background:"linear-gradient(90deg,#00FFB2,#A855F7)",height:"100%",width:`${pct}%`,borderRadius:3}}/></div>
-            {tracker?.startDate&&<div style={{fontSize:9,color:"#4A5568",marginTop:6}}>Started: {new Date(tracker.startDate).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</div>}
-          </div>
-          <div style={{fontSize:9,color:"#4A5568",letterSpacing:3,marginBottom:9}}>CLICK STATUS TO CYCLE</div>
-          <div style={{display:"flex",flexDirection:"column",gap:4}}>
-            {AI_WEEKS.map(w=>{
-              const st=tracker?.weekStatus[w.week]||"not_started";
-              const sm=SMETA[st];
-              const wp=w.projects.map((_,i)=>({k:`${w.week}-${i}`,done:tracker?.projects[`${w.week}-${i}`]||false}));
-              const pd=wp.filter(p=>p.done).length;
-              return(
-                <div key={w.week} style={{background:"#0D1117",border:"1px solid #1A2030",borderRadius:4,padding:"10px 14px",borderLeft:`3px solid ${w.phaseColor}`}}>
-                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6}}>
-                    <div style={{display:"flex",alignItems:"center",gap:10}}>
-                      <span style={{fontFamily:"'Syne',sans-serif",fontSize:11,fontWeight:800,color:w.phaseColor}}>W{w.week}</span>
-                      <div><div style={{fontSize:11,color:"#E8EAF0"}}>{w.title}</div><div style={{fontSize:9,color:"#4A5568"}}>{w.hours}h</div></div>
-                    </div>
-                    <div style={{display:"flex",alignItems:"center",gap:7}}>
-                      {wp.map(p=><span key={p.k} onClick={()=>toggleProj(p.k)} className="chk" style={{fontSize:13,color:p.done?"#00FFB2":"#2A3040"}}>{p.done?"☑":"☐"}</span>)}
-                      <span style={{fontSize:9,color:"#4A5568"}}>{pd}/{w.projects.length}</span>
-                      <button className="sc" onClick={()=>cycleStatus(w.week)} style={{background:sm.color,color:sm.tc,fontSize:8,padding:"3px 8px",letterSpacing:2,textTransform:"uppercase",border:`1px solid ${sm.tc}30`}}>{sm.dot} {sm.label}</button>
-                    </div>
-                  </div>
-                  <div style={{marginTop:6,background:"#1A2030",height:2,borderRadius:1}}><div className="bar" style={{background:w.phaseColor,height:"100%",width:`${w.projects.length?Math.round((pd/w.projects.length)*100):0}%`,borderRadius:1}}/></div>
-                </div>
-              );
-            })}
-          </div>
-          <div style={{textAlign:"center",paddingTop:12,marginTop:12,borderTop:"1px solid #1A2030"}}>
-            <button onClick={()=>{if(window.confirm("Reset AI plan progress?"))resetT();}} style={{background:"transparent",color:"#4A5568",border:"1px solid #1A2030",fontSize:9,padding:"7px 14px",letterSpacing:2,cursor:"pointer",borderRadius:3}}>↺ RESET</button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CTO PLAN COMPONENT
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function CTOPlan(){
-  const [openPhase,setOpenPhase]=useState(null);
-  const [innerTab,setInnerTab]=useState({});
-  const [mainTab,setMainTab]=useState("roadmap");
-  const [tracker,setTracker]=useState(null);
-  const [loaded,setLoaded]=useState(false);
-
-  useEffect(()=>{loadData("cto_plan_v2").then(d=>{setTracker(d||freshCTOTracker());setLoaded(true);});}, []);
-  const save=(n)=>{setTracker(n);saveData("cto_plan_v2",n);};
-  const cycleStatus=(pid)=>{
-    const cur=tracker?.phaseStatus[pid]||"not_started";
-    const nxt=cur==="not_started"?"in_progress":cur==="in_progress"?"done":"not_started";
-    save({...tracker,phaseStatus:{...tracker.phaseStatus,[pid]:nxt}});
-  };
-  const toggleProj=(k)=>save({...tracker,projects:{...tracker.projects,[k]:!tracker.projects?.[k]}});
-  const resetT=()=>save(freshCTOTracker());
-
-  const doneP=tracker?Object.values(tracker.phaseStatus).filter(s=>s==="done").length:0;
-  const totalProj=CTO_PHASES.reduce((s,p)=>s+p.projects.length,0);
-  const doneProj=tracker?Object.values(tracker.projects).filter(Boolean).length:0;
-  const pct=Math.round((doneP/CTO_PHASES.length)*100);
-  const getIT=(pid)=>innerTab[pid]||"overview";
-  const setIT=(pid,t)=>setInnerTab(p=>({...p,[pid]:t}));
+  const doneCount=tracker?Object.values(tracker.steps).filter(Boolean).length:0;
+  const pct=Math.round((doneCount/CTO_STEPS.length)*100);
+  const filteredSteps=activePhase==="ALL"?CTO_STEPS:CTO_STEPS.filter(s=>s.phase===activePhase);
 
   if(!loaded) return <div style={{color:"#A855F7",padding:40,textAlign:"center",fontFamily:"monospace",fontSize:11,letterSpacing:3}}>LOADING...</div>;
 
   return(
     <div>
-      {/* Arch stack */}
-      <div style={{background:"#0D1117",border:"1px solid #1A2030",borderRadius:4,padding:"14px 16px",marginBottom:20}}>
-        <div style={{fontSize:9,color:"#4A5568",letterSpacing:3,marginBottom:10}}>STREAMCORE STACK</div>
-        <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
-          {CTO_ARCH_STACK.map(l=>(
-            <div key={l.layer} style={{background:"#060A0E",border:"1px solid #1A2030",borderRadius:3,padding:"6px 9px",flex:"1 1 140px"}}>
-              <div style={{fontSize:8,color:"#A855F7",letterSpacing:2,marginBottom:3}}>{l.layer}</div>
-              <div style={{display:"flex",flexWrap:"wrap",gap:3}}>
-                {l.items.map(i=><span key={i} style={{fontSize:8,color:"#4A5568",background:"#1A2030",padding:"1px 4px",borderRadius:2}}>{i}</span>)}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Stats */}
+      {/* Header stats */}
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8,marginBottom:20}}>
-        {[["8 PHASES","16 Weeks"],["AWS EKS","Production"],["StreamCore","Netflix-Style"],[`${pct}%`,"CTO Ready"]].map(([v,l])=>(
-          <div key={v} style={{background:"#0D1117",border:"1px solid #A855F725",borderTop:"3px solid #A855F7",padding:"12px 14px",borderRadius:4}}>
-            <div style={{fontFamily:"'Syne',sans-serif",fontSize:20,fontWeight:800,color:"#A855F7"}}>{v}</div>
-            <div style={{fontSize:9,color:"#4A5568",letterSpacing:2,textTransform:"uppercase"}}>{l}</div>
+        {[
+          {l:"STEPS DONE",v:doneCount,t:CTO_STEPS.length,c:"#00FFB2"},
+          {l:"PHASES",v:PHASE_ORDER.length,t:PHASE_ORDER.length,c:"#A855F7"},
+          {l:"PROGRESS",v:pct,t:100,c:"#FACC15",unit:"%"},
+          {l:"EST. COST",v:"~$264",t:null,c:"#FF6B35",raw:true},
+        ].map(s=>(
+          <div key={s.l} style={{background:"#0D1117",border:`1px solid ${s.c}25`,borderTop:`3px solid ${s.c}`,padding:"12px 14px",borderRadius:4}}>
+            <div style={{fontSize:8,color:"#4A5568",letterSpacing:3,marginBottom:5}}>{s.l}</div>
+            <div style={{fontFamily:"'Syne',sans-serif",fontSize:s.raw?16:22,fontWeight:800,color:s.c}}>
+              {s.raw?s.v:s.v}
+              {!s.raw&&!s.unit&&<span style={{fontSize:10,color:"#4A5568",fontFamily:"inherit",fontWeight:400}}> / {s.t}</span>}
+              {s.unit&&<span style={{fontSize:12,color:s.c}}>{s.unit}</span>}
+            </div>
+            {!s.raw&&(
+              <div style={{background:"#1A2030",height:3,borderRadius:2,marginTop:6}}>
+                <div className="bar" style={{background:s.c,height:"100%",width:`${s.unit?s.v:Math.round((s.v/s.t)*100)}%`,borderRadius:2}}/>
+              </div>
+            )}
           </div>
         ))}
       </div>
 
-      {/* Sub-tabs */}
-      <div style={{display:"flex",borderBottom:"1px solid #1A2030",marginBottom:20}}>
-        {[["roadmap","Roadmap"],["tracker","Tracker"]].map(([t,l])=>(
-          <button key={t} className="tb" onClick={()=>setMainTab(t)} style={{color:mainTab===t?"#A855F7":"#4A5568",padding:"10px 16px",fontSize:10,letterSpacing:3,textTransform:"uppercase",borderBottom:mainTab===t?"2px solid #A855F7":"2px solid transparent",marginBottom:-1}}>
-            {l}{t==="tracker"&&doneP>0&&<span style={{marginLeft:5,background:"#A855F720",color:"#A855F7",fontSize:8,padding:"1px 4px",borderRadius:2}}>{doneP}/{CTO_PHASES.length}</span>}
-          </button>
-        ))}
+      {/* Overall progress bar */}
+      <div style={{background:"#0D1117",border:"1px solid #1A2030",borderRadius:4,padding:"12px 16px",marginBottom:20}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+          <span style={{fontSize:9,color:"#4A5568",letterSpacing:3}}>DEPLOYMENT PROGRESS</span>
+          <span style={{fontFamily:"'Syne',sans-serif",fontSize:16,fontWeight:800,color:"#00FFB2"}}>{pct}%</span>
+        </div>
+        <div style={{background:"#1A2030",height:6,borderRadius:3}}>
+          <div className="bar" style={{background:"linear-gradient(90deg,#00FFB2,#A855F7,#FACC15)",height:"100%",width:`${pct}%`,borderRadius:3}}/>
+        </div>
+        {tracker?.startDate&&<div style={{fontSize:9,color:"#4A5568",marginTop:6}}>Started: {new Date(tracker.startDate).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</div>}
       </div>
 
-      {mainTab==="roadmap"&&(
-        <div style={{display:"flex",flexDirection:"column",gap:5}}>
-          {CTO_PHASES.map(phase=>{
-            const isOn=openPhase===phase.id;
-            const st=tracker?.phaseStatus[phase.id]||"not_started";
-            const sm=SMETA[st];
-            const pProjs=phase.projects.map((_,i)=>({k:`${phase.id}-${i}`,done:tracker?.projects[`${phase.id}-${i}`]||false}));
-            const pDone=pProjs.filter(p=>p.done).length;
-            const it=getIT(phase.id);
-            return(
-              <div key={phase.id}>
-                <div className={`ph${isOn?" on":""}`} onClick={()=>setOpenPhase(isOn?null:phase.id)}
-                  style={{background:"#0D1117",borderRadius:isOn?"4px 4px 0 0":4,padding:"14px 18px",borderLeft:`3px solid ${phase.color}`}}>
-                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:7}}>
-                    <div style={{display:"flex",alignItems:"center",gap:11}}>
-                      <span style={{fontFamily:"'Syne',sans-serif",fontSize:12,fontWeight:800,color:phase.color}}>{phase.icon}</span>
-                      <div>
-                        <div style={{display:"flex",alignItems:"center",gap:8}}>
-                          <span style={{fontSize:9,color:"#4A5568",letterSpacing:2}}>WK {phase.week}</span>
-                          <span style={{fontSize:12,color:"#E8EAF0"}}>{phase.title}</span>
-                        </div>
-                        <div style={{fontSize:10,color:"#4A5568",marginTop:1}}>{phase.goal}</div>
+      {/* Phase filter */}
+      <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:20}}>
+        {["ALL",...PHASE_ORDER].map(p=>{
+          const count=CTO_STEPS.filter(s=>s.phase===p).length;
+          const done=CTO_STEPS.filter(s=>s.phase===p&&tracker?.steps[s.id]).length;
+          const col=PHASE_COLORS[p]||"#4A5568";
+          return(
+            <button key={p} className="fb" onClick={()=>setActivePhase(p)} style={{
+              background:activePhase===p?`${col}18`:"#0D1117",
+              color:activePhase===p?col:"#4A5568",
+              border:`1px solid ${activePhase===p?`${col}50`:"#1A2030"}`,
+              fontSize:9,padding:"5px 10px",letterSpacing:1,textTransform:"uppercase"
+            }}>
+              {p}
+              {p!=="ALL"&&<span style={{marginLeft:5,opacity:0.7}}>{done}/{count}</span>}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Steps */}
+      <div style={{display:"flex",flexDirection:"column",gap:5}}>
+        {filteredSteps.map(step=>{
+          const isOpen=openStep===step.id;
+          const done=tracker?.steps[step.id]||false;
+          const col=PHASE_COLORS[step.phase]||"#00FFB2";
+          return(
+            <div key={step.id}>
+              <div className={`wk${isOpen?" on":""}`}
+                onClick={()=>setOpenStep(isOpen?null:step.id)}
+                style={{background:done?"#0A140A":"#0D1117",borderRadius:isOpen?"4px 4px 0 0":4,padding:"14px 18px",borderLeft:`3px solid ${done?"#00FFB2":col}`}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:7}}>
+                  <div style={{display:"flex",alignItems:"center",gap:11}}>
+                    <span onClick={e=>{e.stopPropagation();toggleStep(step.id);}} className="chk"
+                      style={{fontSize:16,color:done?"#00FFB2":"#2A3040",flexShrink:0}}>
+                      {done?"☑":"☐"}
+                    </span>
+                    <div>
+                      <div style={{display:"flex",alignItems:"center",gap:8}}>
+                        <span style={{fontSize:9,color:col,letterSpacing:2,background:`${col}15`,padding:"1px 6px",borderRadius:2}}>{step.phase}</span>
+                        <span style={{fontSize:9,color:"#4A5568"}}>{step.id}</span>
                       </div>
-                    </div>
-                    <div style={{display:"flex",alignItems:"center",gap:7}}>
-                      <span style={{fontSize:9,color:sm.tc}}>{sm.dot}</span>
-                      {pDone>0&&<span style={{fontSize:9,color:"#00FFB2"}}>{pDone}/{phase.projects.length}✓</span>}
-                      <span style={{color:"#4A5568",fontSize:10}}>{isOn?"▲":"▼"}</span>
+                      <div style={{fontSize:12,color:done?"#4A5568":"#E8EAF0",marginTop:2,textDecoration:done?"line-through":"none"}}>{step.title}</div>
                     </div>
                   </div>
-                </div>
-                {isOn&&(
-                  <div style={{background:"#0A0E14",border:"1px solid #1A2030",borderTop:"none",borderRadius:"0 0 4px 4px"}}>
-                    <div style={{display:"flex",borderBottom:"1px solid #1A2030",padding:"0 16px"}}>
-                      {[["overview","Overview"],["content","📖 Commands & Code"]].map(([t,l])=>(
-                        <button key={t} className="itb" onClick={e=>{e.stopPropagation();setIT(phase.id,t);}}
-                          style={{color:it===t?phase.color:"#4A5568",padding:"9px 13px",fontSize:9,letterSpacing:2,textTransform:"uppercase",borderBottom:it===t?`2px solid ${phase.color}`:"2px solid transparent",marginBottom:-1,background:"none",border:"none"}}>
-                          {l}
-                        </button>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <div style={{display:"flex",gap:4}}>
+                      {step.tools.slice(0,3).map(t=>(
+                        <span key={t} style={{fontSize:8,color:"#4A5568",background:"#1A2030",padding:"1px 5px",borderRadius:2}}>{t}</span>
                       ))}
                     </div>
-                    <div style={{padding:"16px"}}>
-                      {it==="overview"&&(
-                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
-                          <div>
-                            <div style={{fontSize:9,color:"#00FFB2",letterSpacing:3,marginBottom:8}}>WHAT YOU LEARN</div>
-                            {phase.skills.map((s,i)=>(
-                              <div key={i} style={{display:"flex",gap:7,marginBottom:5,fontSize:11,color:"#A0A8B8",lineHeight:1.45}}>
-                                <span style={{color:phase.color,flexShrink:0}}>→</span><span>{s}</span>
-                              </div>
-                            ))}
-                            <div style={{marginTop:12}}>
-                              <div style={{fontSize:9,color:"#4A5568",letterSpacing:3,marginBottom:5}}>TOOLS</div>
-                              <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
-                                {phase.tools.map(t=><span key={t} style={{background:"#1A2030",color:"#A0A8B8",fontSize:9,padding:"2px 7px",borderRadius:2}}>{t}</span>)}
-                              </div>
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{fontSize:9,color:"#FF6B35",letterSpacing:3,marginBottom:8}}>DELIVERABLES</div>
-                            {phase.projects.map((p,i)=>{
-                              const pk=`${phase.id}-${i}`;
-                              const done=tracker?.projects[pk]||false;
-                              return(
-                                <div key={i} style={{background:"#0D1117",border:"1px solid #1A2030",borderLeft:`3px solid ${p.hard?"#FF6B35":"#A855F7"}`,padding:"10px 12px",marginBottom:7,borderRadius:"0 4px 4px 0"}}>
-                                  <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:4}}>
-                                    <span onClick={e=>{e.stopPropagation();toggleProj(pk);}} className="chk" style={{fontSize:13,color:done?"#00FFB2":"#2A3040"}}>{done?"☑":"☐"}</span>
-                                    <span style={{fontSize:11,color:done?"#4A5568":"#E8EAF0",textDecoration:done?"line-through":"none"}}>{p.name}</span>
-                                    {p.hard&&<span style={{background:"#FF6B3520",color:"#FF6B35",fontSize:7,padding:"1px 5px",borderRadius:2}}>HARD</span>}
-                                  </div>
-                                  <div style={{fontSize:10,color:"#4A5568",lineHeight:1.5}}>{p.desc}</div>
-                                </div>
-                              );
-                            })}
-                            <button className="sc" onClick={e=>{e.stopPropagation();cycleStatus(phase.id);}}
-                              style={{background:sm.color,color:sm.tc,fontSize:8,padding:"4px 10px",letterSpacing:2,textTransform:"uppercase",border:`1px solid ${sm.tc}30`,marginTop:8}}>
-                              {sm.dot} {sm.label}
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                      {it==="content"&&<ContentRenderer sections={phase.content||[]}/>}
-                    </div>
+                    <span style={{color:"#4A5568",fontSize:10}}>{isOpen?"▲":"▼"}</span>
                   </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {mainTab==="tracker"&&(
-        <div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8,marginBottom:20}}>
-            {[{l:"PHASES DONE",v:doneP,t:CTO_PHASES.length,c:"#A855F7"},{l:"PROJECTS",v:doneProj,t:totalProj,c:"#00FFB2"},{l:"CTO READY",v:pct,t:100,c:"#FACC15",unit:"%"}].map(s=>(
-              <div key={s.l} style={{background:"#0D1117",border:`1px solid ${s.c}25`,borderTop:`3px solid ${s.c}`,padding:"12px 14px",borderRadius:4}}>
-                <div style={{fontSize:8,color:"#4A5568",letterSpacing:3,marginBottom:5}}>{s.l}</div>
-                <div style={{fontFamily:"'Syne',sans-serif",fontSize:22,fontWeight:800,color:s.c}}>{s.v}<span style={{fontSize:10,color:"#4A5568",fontFamily:"inherit",fontWeight:400}}>{s.unit||` / ${s.t}`}</span></div>
-                <div style={{background:"#1A2030",height:3,borderRadius:2,marginTop:6}}><div className="bar" style={{background:s.c,height:"100%",width:`${s.unit?s.v:Math.round((s.v/s.t)*100)}%`,borderRadius:2}}/></div>
-              </div>
-            ))}
-          </div>
-          <div style={{background:"#0D1117",border:"1px solid #A855F730",borderRadius:4,padding:"12px 16px",marginBottom:16}}>
-            <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:9,color:"#A855F7",letterSpacing:3}}>CTO PROGRESS</span><span style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800,color:"#A855F7"}}>{pct}%</span></div>
-            <div style={{background:"#1A2030",height:6,borderRadius:3}}><div className="bar" style={{background:"linear-gradient(90deg,#A855F7,#00FFB2)",height:"100%",width:`${pct}%`,borderRadius:3}}/></div>
-            {tracker?.startDate&&<div style={{fontSize:9,color:"#4A5568",marginTop:6}}>Target: {new Date(new Date(tracker.startDate).getTime()+112*24*60*60*1000).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</div>}
-          </div>
-          <div style={{display:"flex",flexDirection:"column",gap:4}}>
-            {CTO_PHASES.map(phase=>{
-              const st=tracker?.phaseStatus[phase.id]||"not_started";
-              const sm=SMETA[st];
-              const wp=phase.projects.map((_,i)=>({k:`${phase.id}-${i}`,done:tracker?.projects[`${phase.id}-${i}`]||false}));
-              const pd=wp.filter(p=>p.done).length;
-              return(
-                <div key={phase.id} style={{background:"#0D1117",border:"1px solid #1A2030",borderRadius:4,padding:"10px 14px",borderLeft:`3px solid ${phase.color}`}}>
-                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6}}>
-                    <div style={{display:"flex",alignItems:"center",gap:10}}>
-                      <span style={{fontSize:13,color:phase.color}}>{phase.icon}</span>
-                      <div><div style={{fontSize:11,color:"#E8EAF0"}}>{phase.title}</div><div style={{fontSize:9,color:"#4A5568"}}>Week {phase.week}</div></div>
-                    </div>
-                    <div style={{display:"flex",alignItems:"center",gap:7}}>
-                      {wp.map(p=><span key={p.k} onClick={()=>toggleProj(p.k)} className="chk" style={{fontSize:13,color:p.done?"#00FFB2":"#2A3040"}}>{p.done?"☑":"☐"}</span>)}
-                      <span style={{fontSize:9,color:"#4A5568"}}>{pd}/{phase.projects.length}</span>
-                      <button className="sc" onClick={()=>cycleStatus(phase.id)} style={{background:sm.color,color:sm.tc,fontSize:8,padding:"3px 8px",letterSpacing:2,textTransform:"uppercase",border:`1px solid ${sm.tc}30`}}>{sm.dot} {sm.label}</button>
-                    </div>
-                  </div>
-                  <div style={{marginTop:6,background:"#1A2030",height:2,borderRadius:1}}><div className="bar" style={{background:phase.color,height:"100%",width:`${phase.projects.length?Math.round((pd/phase.projects.length)*100):0}%`,borderRadius:1}}/></div>
                 </div>
-              );
-            })}
-          </div>
-          <div style={{textAlign:"center",paddingTop:12,marginTop:12,borderTop:"1px solid #1A2030"}}>
-            <button onClick={()=>{if(window.confirm("Reset CTO plan progress?"))resetT();}} style={{background:"transparent",color:"#4A5568",border:"1px solid #1A2030",fontSize:9,padding:"7px 14px",letterSpacing:2,cursor:"pointer",borderRadius:3}}>↺ RESET</button>
-          </div>
-        </div>
-      )}
+              </div>
+
+              {isOpen&&(
+                <div style={{background:"#0A0E14",border:"1px solid #1A2030",borderTop:"none",borderRadius:"0 0 4px 4px",padding:"20px 18px"}}>
+                  {/* WHY */}
+                  <div style={{marginBottom:18}}>
+                    <div style={{fontSize:9,color:col,letterSpacing:3,marginBottom:8}}>WHY WE'RE DOING THIS</div>
+                    <div style={{fontSize:12,color:"#A0A8B8",lineHeight:1.8,background:"#060A0E",border:`1px solid ${col}20`,borderLeft:`3px solid ${col}`,padding:"12px 16px",borderRadius:"0 4px 4px 0"}}>
+                      {step.why}
+                    </div>
+                  </div>
+
+                  {/* COMMANDS */}
+                  <div style={{marginBottom:16}}>
+                    <div style={{fontSize:9,color:"#00FFB2",letterSpacing:3,marginBottom:8}}>COMMANDS</div>
+                    <CopyableCodeBlock lines={step.commands}/>
+                  </div>
+
+                  {/* EXPECT */}
+                  <div style={{display:"flex",alignItems:"flex-start",gap:10,background:"#0D1A12",border:"1px solid #00FFB230",padding:"10px 14px",borderRadius:4,marginBottom:16}}>
+                    <span style={{color:"#00FFB2",fontSize:14,flexShrink:0}}>✓</span>
+                    <div>
+                      <div style={{fontSize:9,color:"#00FFB2",letterSpacing:2,marginBottom:3}}>WHAT YOU SHOULD SEE</div>
+                      <div style={{fontSize:11,color:"#A0A8B8",lineHeight:1.6}}>{step.expect}</div>
+                    </div>
+                  </div>
+
+                  {/* Mark complete */}
+                  <button className="sc" onClick={e=>{e.stopPropagation();toggleStep(step.id);}}
+                    style={{background:done?"#00FFB220":"#1A2030",color:done?"#00FFB2":"#4A5568",fontSize:9,padding:"6px 14px",letterSpacing:2,textTransform:"uppercase",border:`1px solid ${done?"#00FFB240":"#2A3040"}`}}>
+                    {done?"☑ COMPLETED — CLICK TO UNDO":"☐ MARK AS COMPLETE"}
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{textAlign:"center",paddingTop:16,marginTop:16,borderTop:"1px solid #1A2030"}}>
+        <button onClick={()=>{if(window.confirm("Reset all deployment progress?"))resetT();}}
+          style={{background:"transparent",color:"#4A5568",border:"1px solid #1A2030",fontSize:9,padding:"7px 14px",letterSpacing:2,cursor:"pointer",borderRadius:3}}>
+          ↺ RESET PROGRESS
+        </button>
+      </div>
     </div>
   );
 }
+
+function CopyableCodeBlock({lines}){
+  const [copied,setCopied]=useState(false);
+  const text=lines.join('\n');
+  return(
+    <div style={{background:"#060A0E",border:"1px solid #1A2030",borderRadius:4,overflow:"hidden"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 14px",background:"#0D1117",borderBottom:"1px solid #1A2030"}}>
+        <span style={{fontSize:8,color:"#00FFB2",letterSpacing:2}}>BASH</span>
+        <button onClick={()=>{navigator.clipboard.writeText(text).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),1500);});}}
+          style={{background:"none",border:"none",cursor:"pointer",color:copied?"#00FFB2":"#4A5568",fontSize:9,letterSpacing:1,padding:"2px 6px"}}>
+          {copied?"✓ COPIED":"COPY ALL"}
+        </button>
+      </div>
+      <pre style={{margin:0,padding:"14px",overflowX:"auto",fontSize:10,lineHeight:1.75,color:"#C9D1D9",fontFamily:"'DM Mono','Fira Mono',monospace",whiteSpace:"pre"}}>
+        {lines.map((line,i)=>{
+          const isComment=line.trim().startsWith('#');
+          const isEmpty=line.trim()==='';
+          return(
+            <span key={i} style={{color:isComment?"#4A6A4A":isEmpty?"transparent":"#C9D1D9",display:"block"}}>
+              {isEmpty?" ":line}
+            </span>
+          );
+        })}
+      </pre>
+    </div>
+  );
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROOT APP
@@ -2183,9 +2527,32 @@ export default function App(){
   const aiDoneWeeks = (() => {
     try{const d=JSON.parse(localStorage.getItem("ai_plan_v3")||"{}");return Object.values(d.weekStatus||{}).filter(s=>s==="done").length;}catch{return 0;}
   })();
-  const ctoDonePhases = (() => {
-    try{const d=JSON.parse(localStorage.getItem("cto_plan_v2")||"{}");return Object.values(d.phaseStatus||{}).filter(s=>s==="done").length;}catch{return 0;}
+  const ctoProjectDone = (() => {
+    try{const d=JSON.parse(localStorage.getItem("cto_project_v1")||"{}");return Object.values(d.steps||{}).filter(Boolean).length;}catch{return 0;}
   })();
+
+  const plans = {
+    ai: {
+      accent: "#00FFB2",
+      icon: "◈",
+      label: "AI Infra Plan",
+      badge: aiDoneWeeks > 0 ? `${aiDoneWeeks}/12` : null,
+      header: "SURVIVE THE NEXT 10 YEARS",
+      sub: "DevOps → AI Infrastructure Engineer · 12 Weeks · All materials embedded",
+      note: "Months 1–3",
+    },
+    project: {
+      accent: "#FF6B35",
+      icon: "◆",
+      label: "CTO Project",
+      badge: ctoProjectDone > 0 ? `${ctoProjectDone}/${CTO_STEPS.length}` : null,
+      header: "DEPLOY STREAMCORE",
+      sub: "Multi-cluster EKS · Istio · ArgoCD · RabbitMQ · Redis · Loki · FinOps",
+      note: "Real project. Real commands. CTO-level decisions.",
+    },
+  };
+
+  const active = plans[activePlan];
 
   return(
     <div style={{background:"#080C10",minHeight:"100vh",color:"#E8EAF0",fontFamily:"'DM Mono','Fira Mono',monospace"}}>
@@ -2198,55 +2565,43 @@ export default function App(){
             <span style={{color:"#00FFB2",fontSize:10,letterSpacing:3}}>◈</span>
             <span style={{fontFamily:"'Syne',sans-serif",fontSize:13,fontWeight:800,color:"#E8EAF0"}}>DEVOPS → CTO</span>
             <span style={{color:"#1A2030",fontSize:11,margin:"0 4px"}}>/</span>
-            <span style={{fontSize:9,color:"#4A5568",letterSpacing:2}}>7-Month Master Plan</span>
+            <span style={{fontSize:9,color:"#4A5568",letterSpacing:2}}>10-Year Survival Plan</span>
           </div>
           <div style={{display:"flex",gap:4}}>
-            <button className="ntb" onClick={()=>setActivePlan("ai")} style={{
-              background:activePlan==="ai"?"#00FFB215":"transparent",
-              color:activePlan==="ai"?"#00FFB2":"#4A5568",
-              border:`1px solid ${activePlan==="ai"?"#00FFB240":"#1A2030"}`,
-              padding:"8px 14px",fontSize:10,letterSpacing:2,borderRadius:4,textTransform:"uppercase"
-            }}>
-              <span style={{marginRight:6}}>◈</span>
-              AI Infra Plan
-              {aiDoneWeeks>0&&<span style={{marginLeft:6,background:"#00FFB220",color:"#00FFB2",fontSize:8,padding:"1px 5px",borderRadius:2}}>{aiDoneWeeks}/12</span>}
-            </button>
-            <button className="ntb" onClick={()=>setActivePlan("cto")} style={{
-              background:activePlan==="cto"?"#A855F715":"transparent",
-              color:activePlan==="cto"?"#A855F7":"#4A5568",
-              border:`1px solid ${activePlan==="cto"?"#A855F740":"#1A2030"}`,
-              padding:"8px 14px",fontSize:10,letterSpacing:2,borderRadius:4,textTransform:"uppercase"
-            }}>
-              <span style={{marginRight:6}}>◉</span>
-              CTO Blueprint
-              {ctoDonePhases>0&&<span style={{marginLeft:6,background:"#A855F720",color:"#A855F7",fontSize:8,padding:"1px 5px",borderRadius:2}}>{ctoDonePhases}/8</span>}
-            </button>
+            {Object.entries(plans).map(([key,plan])=>(
+              <button key={key} className="ntb" onClick={()=>setActivePlan(key)} style={{
+                background:activePlan===key?`${plan.accent}18`:"transparent",
+                color:activePlan===key?plan.accent:"#4A5568",
+                border:`1px solid ${activePlan===key?`${plan.accent}40`:"#1A2030"}`,
+                padding:"8px 14px",fontSize:10,letterSpacing:2,borderRadius:4,textTransform:"uppercase"
+              }}>
+                <span style={{marginRight:6}}>{plan.icon}</span>
+                {plan.label}
+                {plan.badge&&<span style={{marginLeft:6,background:`${plan.accent}20`,color:plan.accent,fontSize:8,padding:"1px 5px",borderRadius:2}}>{plan.badge}</span>}
+              </button>
+            ))}
           </div>
         </div>
       </div>
 
       {/* PLAN HEADER */}
-      <div style={{background:activePlan==="ai"?"linear-gradient(180deg,#0D1A12 0%,#080C10 100%)":"linear-gradient(180deg,#0A0D1A 0%,#080C10 100%)",borderBottom:`1px solid ${activePlan==="ai"?"#00FFB240":"#A855F740"}`,padding:"32px 20px 24px",position:"relative",overflow:"hidden"}}>
-        <div style={{position:"absolute",top:0,right:0,width:"35%",height:"100%",background:`radial-gradient(ellipse at top right,${activePlan==="ai"?"#00FFB215":"#A855F715"} 0%,transparent 70%)`,pointerEvents:"none"}}/>
+      <div style={{background:`linear-gradient(180deg,${activePlan==="ai"?"#0D1A12":"#100D0A"} 0%,#080C10 100%)`,borderBottom:`1px solid ${active.accent}40`,padding:"32px 20px 24px",position:"relative",overflow:"hidden"}}>
+        <div style={{position:"absolute",top:0,right:0,width:"35%",height:"100%",background:`radial-gradient(ellipse at top right,${active.accent}15 0%,transparent 70%)`,pointerEvents:"none"}}/>
         <div style={{maxWidth:1000,margin:"0 auto"}}>
-          <div style={{fontSize:9,color:activePlan==="ai"?"#00FFB2":"#A855F7",letterSpacing:4,textTransform:"uppercase",marginBottom:8}}>
-            {activePlan==="ai"?"◈ PHASE 1 OF 2 · 12 WEEKS · AI INFRASTRUCTURE":"◉ PHASE 2 OF 2 · 16 WEEKS · CTO BLUEPRINT"}
+          <div style={{fontSize:9,color:active.accent,letterSpacing:4,textTransform:"uppercase",marginBottom:8}}>
+            {active.icon} {activePlan==="ai"?"PHASE 1 OF 2 · 12 WEEKS · AI INFRASTRUCTURE":"LIVE PROJECT · STEP-BY-STEP · CTO DECISIONS"}
           </div>
           <h1 style={{fontFamily:"'Syne',sans-serif",fontSize:"clamp(22px,4vw,42px)",fontWeight:800,color:"#FFF",letterSpacing:-1,marginBottom:6}}>
-            {activePlan==="ai"?"SURVIVE THE NEXT 10 YEARS":"BUILD STREAMCORE"}
+            {active.header}
           </h1>
-          <p style={{color:activePlan==="ai"?"#00FFB2":"#A855F7",fontSize:12,letterSpacing:1}}>
-            {activePlan==="ai"?"DevOps → AI Infrastructure Engineer · All learning materials embedded":"Netflix-scale platform on AWS · Every command embedded · Zero Googling"}
-          </p>
-          <p style={{color:"#4A5568",fontSize:10,marginTop:6}}>
-            {activePlan==="ai"?"Months 1–3":"Months 4–7"} · {activePlan==="ai"?"Follow with the CTO Blueprint →":"Follows the AI Infra Plan"}
-          </p>
+          <p style={{color:active.accent,fontSize:12,letterSpacing:1,marginBottom:4}}>{active.sub}</p>
+          <p style={{color:"#4A5568",fontSize:10}}>{active.note}</p>
         </div>
       </div>
 
       {/* PLAN CONTENT */}
       <div style={{maxWidth:1000,margin:"0 auto",padding:"24px 20px"}}>
-        {activePlan==="ai"?<AIPlan/>:<CTOPlan/>}
+        {activePlan==="ai" ? <AIPlan/> : <CTOProject/>}
       </div>
 
       {/* FOOTER */}
@@ -2254,10 +2609,10 @@ export default function App(){
         <div style={{maxWidth:1000,margin:"0 auto",display:"flex",justifyContent:"center",gap:20,flexWrap:"wrap"}}>
           {(activePlan==="ai"?
             ["Wk1-4: Foundation","Wk5-6: AI Agents","Wk7-8: Complex Arch","Wk9-10: GPU Infra","Wk11-12: Capstone"]:
-            ["Wk1-2: AWS+EKS","Wk3-4: Microservices","Wk5-6: Data Layer","Wk7-8: Service Mesh","Wk9-10: Observability","Wk11-12: Security","Wk13-16: Scale+Capstone"]
+            ["1: Foundation","2: GitOps","3: FinOps","4: Istio","5: Data Layer","6: Services","7: Logging","8: Observability","9: Hardening"]
           ).map((s,i)=>(
             <div key={i} style={{fontSize:9,color:"#4A5568",letterSpacing:1}}>
-              <span style={{color:activePlan==="ai"?"#00FFB2":"#A855F7",marginRight:4}}>{activePlan==="ai"?"◈":"◉"}</span>{s}
+              <span style={{color:active.accent,marginRight:4}}>{active.icon}</span>{s}
             </div>
           ))}
         </div>
